@@ -1,6 +1,6 @@
 # Gather IP facts from ipify.org
 - name: Get my public IP
-  hosts: localhost
+  hosts: all
   become: true
   become_method: sudo
   tasks:

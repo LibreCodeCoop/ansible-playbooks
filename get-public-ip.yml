@@ -1,0 +1,14 @@
+# Gather IP facts from ipify.org
+- name: Get my public IP
+  hosts: localhost
+  gather_facts: true
+  tasks:
+    - name: Get public ip
+      community.general.ipify_facts:
+      register: public_ip
+
+    - name: Show public ip
+      ansible.builtin.debug:
+        msg: "{{ public_ip }}"
+
+

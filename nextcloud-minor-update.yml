@@ -1,0 +1,253 @@
+---
+# Atualiza o Nextcloud para a versão mais recente dentro da mesma major version
+# É feito o build da imagem no ambiente.
+ 
+- name: Update Nextcloud to latest version
+  hosts: nextcloud_servers
+  gather_facts: yes
+  become: yes
+  # Variáveis devem ser definidas no inventory.ini ou passadas via -e
+  # Exemplo no inventory: nextcloud_url=https://cloud.example.com nextcloud_project_dir=~/projects/nextcloud
+
+  tasks:
+    - name: Set default variables
+      ansible.builtin.set_fact:
+        nextcloud_url: "{{ nextcloud_url | default('') }}"
+        nextcloud_project_dir: "{{ nextcloud_project_dir | default('~/projects/nextcloud-docker') }}"
+        nextcloud_app_container: "{{ nextcloud_app_container | default('app') }}"
+        nextcloud_version: "{{ nextcloud_version | default('stable-fpm') }}"
+        nextcloud_wait_retries: "{{ nextcloud_wait_retries | default(30) }}"
+        nextcloud_wait_delay: "{{ nextcloud_wait_delay | default(10) }}"
+
+    - name: Validate required variables
+      ansible.builtin.fail:
+        msg:
+          - "ERROR: Variable 'nextcloud_url' is required but not defined!"
+          - "Define it in inventory.ini:"
+          - "  {{ inventory_hostname }} nextcloud_url=https://your-domain.com nextcloud_project_dir=/path/to/project"
+          - "Or pass via command line:"
+          - "  ansible-playbook nextcloud-update.yml -e 'nextcloud_url=https://your-domain.com'"
+      when: nextcloud_url == ''
+
+    - name: Show update starting for host
+      ansible.builtin.debug:
+        msg:
+          - "============================================"
+          - "Starting Nextcloud update on: {{ inventory_hostname }}"
+          - "URL: {{ nextcloud_url }}"
+          - "Project: {{ nextcloud_project_dir }}"
+          - "============================================"
+      tags: always
+
+    - name: Get current Nextcloud version
+      community.docker.docker_compose_v2_exec:
+        service: "{{ nextcloud_app_container }}"
+        user: www-data
+        project_src: "{{ nextcloud_project_dir }}"
+        command: php occ --version
+      register: current_version
+      changed_when: false
+      failed_when: false
+
+    - name: Show current version
+      ansible.builtin.debug:
+        msg: "Current version: {{ current_version.stdout | default('unavailable') }}"
+
+    - name: Build and pull new images
+      community.docker.docker_compose_v2:
+        project_src: "{{ nextcloud_project_dir }}"
+        build: always
+        pull: always
+      register: build_result
+      # Nota: Para updates, usamos a versão definida no docker-compose.yml
+      # Para upgrades de major version, use nextcloud-upgrade.yml com --build-arg
+
+    - name: Show build results
+      ansible.builtin.debug:
+        msg: "{{ build_result.actions }}"
+      when: build_result.actions is defined
+
+    - name: Wait for Nextcloud container to finish restarting
+      community.docker.docker_compose_v2_exec:
+        service: "{{ nextcloud_app_container }}"
+        user: www-data
+        project_src: "{{ nextcloud_project_dir }}"
+        command: "php occ status"
+      register: nextcloud_container_ready_after_build
+      changed_when: false
+      failed_when: false
+      until: nextcloud_container_ready_after_build.rc == 0
+      retries: "{{ nextcloud_wait_retries }}"
+      delay: "{{ nextcloud_wait_delay }}"
+
+    - name: Give Nextcloud a few seconds to settle after rebuild
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: Enable maintenance mode
+      community.docker.docker_compose_v2_exec:
+        service: "{{ nextcloud_app_container }}"
+        user: www-data
+        project_src: "{{ nextcloud_project_dir }}"
+        command: "php occ maintenance:mode --on"
+      register: maintenance_on
+      changed_when: false
+      failed_when: false
+      until: maintenance_on.rc == 0
+      retries: "{{ nextcloud_wait_retries }}"
+      delay: "{{ nextcloud_wait_delay }}"
+
+    - name: Show maintenance mode status
+      ansible.builtin.debug:
+        msg: "Maintenance mode enabled"
+
+    - name: Recreate containers with new images
+      community.docker.docker_compose_v2:
+        project_src: "{{ nextcloud_project_dir }}"
+        state: present
+        recreate: always
+      register: recreate_result
+
+    - name: Wait for Nextcloud container to be ready
+      ansible.builtin.uri:
+        url: "{{ nextcloud_url }}/status.php"
+        return_content: yes
+        status_code: 200
+        timeout: 100
+        validate_certs: yes
+      register: nextcloud_status
+      until: nextcloud_status.status == 200 and '"installed":true' in nextcloud_status.content
+      retries: "{{ nextcloud_wait_retries }}"
+      delay: "{{ nextcloud_wait_delay }}"
+      failed_when: false
+
+    - name: Check if Nextcloud is accessible
+      ansible.builtin.fail:
+        msg: "Nextcloud did not become accessible after {{ nextcloud_wait_retries * nextcloud_wait_delay }} seconds"
+      when: nextcloud_status.status != 200
+
+    - name: Add missing database columns
+      community.docker.docker_compose_v2_exec:
+        service: "{{ nextcloud_app_container }}"
+        user: www-data
+        project_src: "{{ nextcloud_project_dir }}"
+        command: "php occ db:add-missing-columns"
+      register: db_columns
+      failed_when: false
+
+    - name: Add missing database indices
+      community.docker.docker_compose_v2_exec:
+        service: "{{ nextcloud_app_container }}"
+        user: www-data
+        project_src: "{{ nextcloud_project_dir }}"
+        command: "php occ db:add-missing-indices"
+      register: db_indices
+      failed_when: false
+
+    - name: Add missing primary keys
+      community.docker.docker_compose_v2_exec:
+        service: "{{ nextcloud_app_container }}"
+        user: www-data
+        project_src: "{{ nextcloud_project_dir }}"
+        command: "php occ db:add-missing-primary-keys"
+      register: db_primary_keys
+      failed_when: false
+
+    - name: Run maintenance repair
+      community.docker.docker_compose_v2_exec:
+        service: "{{ nextcloud_app_container }}"
+        user: www-data
+        project_src: "{{ nextcloud_project_dir }}"
+        command: "php occ maintenance:repair --include-expensive"
+      register: maintenance_repair
+      failed_when: false
+
+    - name: Set maintenance window start
+      community.docker.docker_compose_v2_exec:
+        service: "{{ nextcloud_app_container }}"
+        user: www-data
+        project_src: "{{ nextcloud_project_dir }}"
+        command: "php occ config:system:set maintenance_window_start --type=integer --value=1"
+      register: maintenance_window
+      failed_when: false
+
+    - name: Update all apps
+      community.docker.docker_compose_v2_exec:
+        service: "{{ nextcloud_app_container }}"
+        user: www-data
+        project_src: "{{ nextcloud_project_dir }}"
+        command: "php occ app:update --all"
+      register: app_update
+      failed_when: false
+
+    - name: Run upgrade command
+      community.docker.docker_compose_v2_exec:
+        service: "{{ nextcloud_app_container }}"
+        user: www-data
+        project_src: "{{ nextcloud_project_dir }}"
+        command: "php occ upgrade"
+      register: upgrade_result
+      failed_when: false
+
+    - name: Disable maintenance mode
+      community.docker.docker_compose_v2_exec:
+        service: "{{ nextcloud_app_container }}"
+        user: www-data
+        project_src: "{{ nextcloud_project_dir }}"
+        command: "php occ maintenance:mode --off"
+      register: maintenance_off
+
+    - name: Get updated Nextcloud version
+      community.docker.docker_compose_v2_exec:
+        service: "{{ nextcloud_app_container }}"
+        user: www-data
+        project_src: "{{ nextcloud_project_dir }}"
+        command: "php occ --version"
+      register: updated_version
+
+    - name: Show update summary
+      ansible.builtin.debug:
+        msg:
+          - "============================================"
+          - "=== Nextcloud Update Summary ==="
+          - "Host: {{ inventory_hostname }} ({{ ansible_hostname }})"
+          - "URL: {{ nextcloud_url }}"
+          - "Previous version: {{ current_version.stdout }}"
+          - "Updated version: {{ updated_version.stdout }}"
+          - "Maintenance mode: Disabled"
+          - "Update completed successfully!"
+          - "============================================"
+
+    - name: Record successful update
+      ansible.builtin.set_fact:
+        update_status: "success"
+        update_previous_version: "{{ current_version.stdout }}"
+        update_new_version: "{{ updated_version.stdout }}"
+        update_timestamp: "{{ ansible_date_time.iso8601 }}"
+
+# Play final para mostrar resumo de todos os hosts
+- name: Show update summary for all hosts
+  hosts: vps_teste2
+  gather_facts: no
+  become: no
+  tasks:
+    - name: Display final summary
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "╔════════════════════════════════════════════════════════╗"
+          - "║     NEXTCLOUD UPDATE SUMMARY - ALL HOSTS              ║"
+          - "╚════════════════════════════════════════════════════════╝"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Show individual host results
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "  Status: {{ update_status | default('failed') }}"
+          - "  Previous: {{ update_previous_version | default('unknown') }}"
+          - "  Updated:  {{ update_new_version | default('unknown') }}"
+          - "  Time: {{ update_timestamp | default('unknown') }}"
+          - "  ---"
+      when: update_status is defined

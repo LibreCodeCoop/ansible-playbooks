@@ -1,0 +1,3 @@
+# test-all.yml
+- import_playbook: get-public-ip.yml
+- import_playbook: nextcloud-update-apps.yml

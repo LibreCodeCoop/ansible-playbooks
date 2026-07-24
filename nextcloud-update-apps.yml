@@ -1,0 +1,128 @@
+---
+# Atualiza o Aplicativos do Nextcloud para a versão mais recente
+# Varíavel obrigatória nextcloud_url=https://your-domain.com
+
+- name: Update Nextcloud apps
+  hosts: all
+  gather_facts: no
+  become: yes
+
+  tasks:
+    - name: Set default variables
+      ansible.builtin.set_fact:
+        nextcloud_url: "{{ nextcloud_url | default('') }}"
+        nextcloud_project_dir: "{{ nextcloud_project_dir | default('~/projects/nextcloud-docker') }}"
+        nextcloud_app_container: "{{ nextcloud_app_container | default('app') }}"
+        nextcloud_version: "{{ nextcloud_version | default('stable-fpm') }}"
+        nextcloud_wait_retries: "{{ nextcloud_wait_retries | default(30) }}"
+        nextcloud_wait_delay: "{{ nextcloud_wait_delay | default(10) }}"
+        nextcloud_occ_update: "php occ app:update --all"
+        nextcloud_occ_upgrade: "php occ upgrade"
+
+    - name: Validate required variables
+      ansible.builtin.fail:
+        msg:
+          - "ERROR: Variable 'nextcloud_url' is required but not defined!"
+          - "Define it in inventory.ini:"
+          - "  {{ inventory_hostname }} nextcloud_url=https://your-domain.com nextcloud_project_dir=/path/to/project"
+          - "Or pass via command line:"
+          - "  ansible-playbook nextcloud-update.yml -e 'nextcloud_url=https://your-domain.com'"
+      when: nextcloud_url == ''
+
+    - name: Show update starting for host
+      ansible.builtin.debug:
+        msg:
+          - "============================================"
+          - "Starting Nextcloud update on: {{ inventory_hostname }}"
+          - "URL: {{ nextcloud_url }}"
+          - "Project: {{ nextcloud_project_dir }}"
+          - "============================================"
+      tags: always
+    - name: Get current Nextcloud version
+      community.docker.docker_compose_v2_exec:
+        service: "{{ nextcloud_app_container }}"
+        user: www-data
+        project_src: "{{ nextcloud_project_dir }}"
+        command: php occ --version
+      register: current_version
+
+    - name: Show current version
+      ansible.builtin.debug:
+        msg: "Current version: {{ current_version.stdout }}"
+
+    - name: Update all apps
+      community.docker.docker_compose_v2_exec:
+        service: "{{ nextcloud_app_container }}"
+        user: www-data
+        project_src: "{{ nextcloud_project_dir }}"
+        command: "{{ nextcloud_occ_update }}"
+      register: app_update
+      failed_when: false
+
+    - name: Add missing database columns
+      community.docker.docker_compose_v2_exec:
+        service: "{{ nextcloud_app_container }}"
+        user: www-data
+        project_src: "{{ nextcloud_project_dir }}"
+        command: php occ db:add-missing-columns
+      register: db_columns
+      failed_when: false
+
+    - name: Add missing database indices
+      community.docker.docker_compose_v2_exec:
+        service: "{{ nextcloud_app_container }}"
+        user: www-data
+        project_src: "{{ nextcloud_project_dir }}"
+        command: php occ db:add-missing-indices
+      register: db_indices
+      failed_when: false
+
+    - name: Add missing database primary keys
+      community.docker.docker_compose_v2_exec:
+        service: "{{ nextcloud_app_container }}"
+        user: www-data
+        project_src: "{{ nextcloud_project_dir }}"
+        command: php occ db:add-missing-primary-keys
+      register: db_primary_keys
+      failed_when: false
+
+    - name: Run maintenance repair
+      community.docker.docker_compose_v2_exec:
+        service: "{{ nextcloud_app_container }}"
+        user: www-data
+        project_src: "{{ nextcloud_project_dir }}"
+        command: php occ maintenance:repair --include-expensive
+      register: maintenance_repair
+      failed_when: false
+
+    - name: Run database upgrade (CRITICAL STEP)
+      community.docker.docker_compose_v2_exec:
+        service: "{{ nextcloud_app_container }}"
+        user: www-data
+        project_src: "{{ nextcloud_project_dir }}"
+        command: "{{ nextcloud_occ_upgrade }}"
+      register: upgrade_output
+      failed_when: false
+
+    - name: Wait for Nextcloud container to be ready
+      ansible.builtin.uri:
+        url: "{{ nextcloud_url }}/status.php"
+        return_content: yes
+        status_code: 200
+        timeout: 100
+        validate_certs: yes
+      register: nextcloud_status
+      until: nextcloud_status.status == 200 and '"installed":true' in nextcloud_status.content
+      retries: "{{ nextcloud_wait_retries }}"
+      delay: "{{ nextcloud_wait_delay }}"
+      failed_when: false
+
+    - name: Check if Nextcloud is accessible
+      ansible.builtin.fail:
+        msg: "Nextcloud did not become accessible after {{ nextcloud_wait_retries * nextcloud_wait_delay }} seconds"
+      when: nextcloud_status.status != 200
+
+    - name: Record successful update
+      ansible.builtin.set_fact:
+        update_status: "success"
+        update_previous_version: "{{ current_version.stdout }}"

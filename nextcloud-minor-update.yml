@@ -3,7 +3,7 @@
 # É feito o build da imagem no ambiente.
  
 - name: Update Nextcloud to latest version
-  hosts: nextcloud_servers
+  hosts: all
   gather_facts: yes
   become: yes
   # Variáveis devem ser definidas no inventory.ini ou passadas via -e

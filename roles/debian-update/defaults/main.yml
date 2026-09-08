@@ -1,0 +1,4 @@
+---
+reboot_required_file: /var/run/reboot-required
+critical_services:
+  - ssh

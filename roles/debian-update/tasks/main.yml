@@ -1,0 +1,37 @@
+---
+- name: Atualizar cache do apt
+  apt:
+    update_cache: yes
+    cache_valid_time: 3600
+
+- name: Fazer upgrade dos pacotes
+  apt:
+    upgrade: dist
+    autoremove: yes
+    autoclean: yes
+  register: upgrade_result
+
+- name: Verificar se reinicialização é necessária
+  stat:
+    path: "{{ reboot_required_file }}"
+  register: reboot_required
+
+- name: Reiniciar servidor se necessário
+  reboot:
+    reboot_timeout: 300
+    connect_timeout: 5
+    test_command: uptime
+  when: reboot_required.stat.exists
+
+- name: Coletar serviços disponíveis após reinicialização
+  ansible.builtin.service_facts:
+  when: reboot_required.stat.exists
+
+- name: Verificar serviços críticos após reinicialização
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: started
+  loop: "{{ critical_services }}"
+  when:
+    - reboot_required.stat.exists
+    - item in ansible_facts.services or (item ~ '.service') in ansible_facts.services

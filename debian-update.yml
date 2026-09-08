@@ -1,0 +1,6 @@
+---
+- name: Atualizar servidores Debian
+  hosts: all
+  become: yes
+  roles:
+    - debian-update

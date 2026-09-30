@@ -1,0 +1,14 @@
+bind 0.0.0.0
+port {{ redis_server_port }}
+protected-mode yes
+supervised systemd
+daemonize no
+dir /var/lib/redis
+appendonly yes
+appendfsync everysec
+requirepass {{ redis_password }}
+masterauth {{ redis_password }}
+replica-serve-stale-data yes
+replica-read-only yes
+replica-announce-ip {{ wg_ip }}
+replica-announce-port {{ redis_server_port }}

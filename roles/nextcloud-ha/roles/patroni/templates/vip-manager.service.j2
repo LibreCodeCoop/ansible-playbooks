@@ -1,0 +1,22 @@
+[Unit]
+Description=Patroni leader VIP manager for WireGuard
+After=network-online.target wg-quick@{{ wireguard_interface }}.service patroni.service
+Wants=network-online.target
+Requires=wg-quick@{{ wireguard_interface }}.service patroni.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/local/sbin/patroni-vip-manager
+Restart=always
+RestartSec=2
+TimeoutStopSec=10
+NoNewPrivileges=false
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+AmbientCapabilities=CAP_NET_ADMIN
+
+[Install]
+WantedBy=multi-user.target

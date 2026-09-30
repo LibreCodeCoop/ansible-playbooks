@@ -1,0 +1,37 @@
+#!/bin/sh
+set -eu
+
+VIP="{{ vip_address }}"
+INTERFACE="{{ wireguard_interface }}"
+
+if ip -o addr show dev "$INTERFACE" | awk '{print $4}' | grep -q "^${VIP}/"; then
+  vip_present=1
+else
+  vip_present=0
+fi
+
+cat <<EOF
+# HELP nextcloud_vip_present Whether the PostgreSQL VIP is present on this node.
+# TYPE nextcloud_vip_present gauge
+nextcloud_vip_present{vip="${VIP}",node="{{ inventory_hostname }}"} ${vip_present}
+EOF
+
+if command -v wg >/dev/null 2>&1 && wg show "$INTERFACE" >/dev/null 2>&1; then
+  wg show "$INTERFACE" dump | tail -n +2 | while IFS='\t' read -r public_key _ _ allowed_ips latest_handshake rx_bytes tx_bytes _; do
+    [ -n "$public_key" ] || continue
+    case "$latest_handshake" in
+      ''|*[!0-9]*) peer_up=0 ;;
+      *)
+        now=$(date +%s)
+        age=$((now - latest_handshake))
+        if [ "$age" -le 180 ]; then peer_up=1; else peer_up=0; fi
+        ;;
+    esac
+    printf 'wireguard_peer_up{node="%s",peer="%s",allowed_ips="%s"} %s\n' \
+      "{{ inventory_hostname }}" "$public_key" "$allowed_ips" "$peer_up"
+    printf 'wireguard_peer_receive_bytes_total{node="%s",peer="%s"} %s\n' \
+      "{{ inventory_hostname }}" "$public_key" "${rx_bytes:-0}"
+    printf 'wireguard_peer_transmit_bytes_total{node="%s",peer="%s"} %s\n' \
+      "{{ inventory_hostname }}" "$public_key" "${tx_bytes:-0}"
+  done
+fi

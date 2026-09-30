@@ -1,0 +1,5 @@
+roles/nextcloud-ha/.onlyoffice_secrets/
+roles/nextcloud-ha/.generated-secrets/
+roles/nextcloud-ha/group_vars/vault.yml
+roles/nextcloud-ha/playbooks/length=*
+roles/nextcloud-ha/graphify-out/

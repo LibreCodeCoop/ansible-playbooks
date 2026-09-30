@@ -1,0 +1,62 @@
+---
+- name: Deploy monitoring agents for Nextcloud HA
+  hosts: nextcloud_cluster
+  gather_facts: true
+  become: true
+
+  vars:
+    node_exporter_textfile_dir: /var/lib/prometheus/node-exporter
+    node_exporter_service: prometheus-node-exporter
+
+  tasks:
+    - name: Install Node Exporter and WireGuard tools
+      apt:
+        name:
+          - prometheus-node-exporter
+          - wireguard-tools
+        state: present
+        update_cache: true
+
+    - name: Create Node Exporter textfile directory
+      file:
+        path: "{{ node_exporter_textfile_dir }}"
+        state: directory
+        owner: prometheus
+        group: prometheus
+        mode: '0755'
+
+    - name: Install HA metrics collector
+      template:
+        src: ../templates/nextcloud-ha-metrics.sh.j2
+        dest: /usr/local/sbin/nextcloud-ha-metrics
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Collect HA metrics periodically
+      cron:
+        name: Nextcloud HA metrics
+        user: root
+        minute: "*"
+        job: >-
+          /usr/local/sbin/nextcloud-ha-metrics
+          > {{ node_exporter_textfile_dir }}/nextcloud_ha.prom.tmp
+          && chown prometheus:prometheus {{ node_exporter_textfile_dir }}/nextcloud_ha.prom.tmp
+          && chmod 0644 {{ node_exporter_textfile_dir }}/nextcloud_ha.prom.tmp
+          && mv {{ node_exporter_textfile_dir }}/nextcloud_ha.prom.tmp
+          {{ node_exporter_textfile_dir }}/nextcloud_ha.prom
+
+    - name: Enable and start Node Exporter
+      systemd:
+        name: "{{ node_exporter_service }}"
+        enabled: true
+        state: started
+
+    - name: Verify Node Exporter endpoint locally
+      uri:
+        url: "http://127.0.0.1:{{ node_exporter_port }}/metrics"
+        status_code: 200
+      register: node_exporter_check
+      retries: 5
+      delay: 2
+      until: node_exporter_check.status == 200

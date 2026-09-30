@@ -1,0 +1,137 @@
+---
+# === WireGuard ===
+wireguard_port: 51820
+wireguard_network: 10.0.0.0/24
+wireguard_interface: wg0
+wireguard_mtu: 1380
+
+# === VIP (Gerenciado pelo vip_patroni) ===
+vip_address: 10.0.0.100
+vip_netmask: 24
+
+# === Patroni ===
+patroni_scope: nextcloud-cluster
+patroni_namespace: /db/
+patroni_api_port: 8008
+postgres_port: 5432
+postgres_version: "17"
+postgres_replication_password: "{{ vault_postgres_replication_password | default('') }}"
+postgres_superuser_password: "{{ vault_postgres_superuser_password | default('') }}"
+monitoring_postgres_user: postgres_exporter
+
+# === etcd ===
+etcd_port_client: 2379
+etcd_port_peer: 2380
+
+# === Nextcloud ===
+nextcloud_domain: "nextcloud.example.invalid"
+nextcloud_db_name: "nextcloud"
+nextcloud_db_user: "nextcloud"
+nextcloud_db_password: "{{ vault_nextcloud_db_password | default('') }}"
+nextcloud_onlyoffice_enabled: "{{ 'resiliencia' in group_names }}"
+nextcloud_onlyoffice_url_path: "/ds-vpath/"
+nextcloud_project_path: "/opt/nextcloud-docker"
+nextcloud_repository_url: "https://github.com/LibreCodeCoop/nextcloud-docker.git"
+nextcloud_repository_version: "main"
+nextcloud_compose_file: "docker-compose-garages3.yml"
+nextcloud_image_version: "stable-fpm"
+nextcloud_postgres_host: "{{ vip_address }}"
+nextcloud_postgres_port: 5432
+nextcloud_trusted_domains: "{{ nextcloud_domain }}"
+nextcloud_timezone: "America/Sao_Paulo"
+nextcloud_admin_user: "admin"
+nextcloud_admin_password: "{{ vault_nextcloud_admin_password | default('') }}"
+nextcloud_admin_email: "{{ vault_nextcloud_admin_email | default('admin@example.com') }}"
+nextcloud_default_phone_region: "BR"
+# Horario UTC. 04:00 UTC corresponde a 01:00 em America/Sao_Paulo.
+nextcloud_maintenance_window_start: 4
+nextcloud_trusted_proxies:
+  - "172.18.0.0/16"
+  - "172.19.0.0/16"
+  - "172.20.0.0/16"
+nextcloud_forwarded_for_headers:
+  - "HTTP_X_FORWARDED_FOR"
+nextcloud_overwrite_protocol: "https"
+ssh_service_port: "{{ ansible_port | default(22) }}"
+nextcloud_enforce_twofactor: true
+nextcloud_disable_unused_app_api: true
+# Ative somente em uma execucao administrativa apos upgrades.
+nextcloud_run_expensive_mimetype_migrations: false
+
+# === OnlyOffice ===
+onlyoffice_db_name: "onlyoffice"
+onlyoffice_db_user: "onlyoffice"
+onlyoffice_db_password: "{{ vault_onlyoffice_db_password | default('') }}"
+onlyoffice_jwt_secret: "{{ vault_onlyoffice_jwt_secret | default('') }}"
+onlyoffice_project_path: "/root/projects/onlyoffice"
+onlyoffice_docker_image: "ghcr.io/thomisus/onlyoffice-documentserver-unlimited:9.2.1"
+nextcloud_internal_network_name: "{{ nextcloud_project_path | basename }}_internal"
+onlyoffice_document_server_url: "https://{{ nextcloud_domain }}{{ nextcloud_onlyoffice_url_path }}"
+onlyoffice_document_server_internal_url: "http://onlyoffice/"
+onlyoffice_storage_url: "http://web/"
+nextcloud_onlyoffice_nginx_override_content: |
+  # OnlyOffice Document Server via /ds-vpath/.
+  # The trailing slash in proxy_pass strips the prefix before the upstream.
+  location ^~ /ds-vpath/ {
+      proxy_pass http://onlyoffice/;
+      proxy_http_version 1.1;
+      proxy_set_header Host $host;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Host $host/ds-vpath;
+      proxy_set_header X-Forwarded-Proto https;
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection "upgrade";
+      proxy_buffering off;
+      proxy_read_timeout 3600;
+      proxy_send_timeout 3600;
+      client_max_body_size 0;
+  }
+
+# === Garage S3 ===
+garage_s3_region: "garage"
+garage_enabled: true
+garage_s3_bucket: "nextcloud-data"
+garage_s3_key_name: "nextcloud"
+garage_zone: "dc1"
+garage_capacity: "1T"
+garage_replication_factor: 3
+# Each Nextcloud node talks to its local Garage API. This avoids making every
+# PHP container depend on a single cluster member for object storage access.
+garage_s3_endpoint_host: "{{ wg_ip }}"
+garage_s3_api_port: 3900
+garage_rpc_port: 3901
+garage_admin_port: 3903
+garage_s3_use_ssl: false
+garage_s3_root_domain: ".s3.internal"
+garage_s3_key_id: "{{ vault_garage_s3_key_id | default('') }}"
+garage_s3_secret: "{{ vault_garage_s3_secret | default('') }}"
+garage_aws_cli_profile: "garage"
+garage_aws_cli_config_path: "/root/.aws/config"
+garage_aws_cli_credentials_path: "/root/.aws/credentials"
+garage_aws_cli_endpoint_url: "{{ garage_s3_use_ssl | bool | ternary('https', 'http') }}://{{ garage_s3_endpoint_host }}:{{ garage_s3_api_port }}"
+
+# Estes valores devem existir em group_vars/vault.yml, protegido com ansible-vault.
+garage_rpc_secret: "{{ vault_garage_rpc_secret | default('') }}"
+garage_admin_token: "{{ vault_garage_admin_token | default('') }}"
+garage_metrics_token: "{{ vault_garage_metrics_token | default('') }}"
+
+# === Redis ===
+redis_sentinel_port: 26379
+redis_sentinel_master_name: "nextcloud-redis"
+redis_sentinel_quorum: 2
+redis_initial_master_host: "{{ hostvars[groups['nextcloud_cluster'][0]].wg_ip }}"
+redis_server_port: 6379
+redis_proxy_port: 6380
+nextcloud_redis_host: "{{ wg_ip }}"
+nextcloud_redis_port: "{{ redis_proxy_port }}"
+redis_host: "{{ nextcloud_redis_host }}"
+redis_port: "{{ nextcloud_redis_port }}"
+redis_password: "{{ vault_redis_password | default('') }}"
+
+# === Monitoramento ===
+prometheus_port: 9090
+node_exporter_port: 9100
+
+# === Firewall opcional ===
+# ssh_allowed_cidr: "203.0.113.10/32"

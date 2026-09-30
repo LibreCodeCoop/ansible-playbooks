@@ -1,0 +1,19 @@
+port {{ redis_sentinel_port }}
+bind 0.0.0.0
+# Sentinels talk to each other over the WireGuard IPs without a
+# Sentinel-level password. With protected-mode enabled they reject each
+# other's PINGs, never reach quorum, and Redis cannot fail over when a node
+# goes down. Port {{ redis_sentinel_port }} is restricted to the WireGuard
+# network by 04-firewall.yml, so disabling protected-mode is safe.
+protected-mode no
+supervised systemd
+daemonize no
+dir /var/lib/redis
+
+sentinel monitor {{ redis_sentinel_master_name }} {{ redis_initial_master_host }} {{ redis_server_port }} {{ redis_sentinel_quorum }}
+sentinel auth-pass {{ redis_sentinel_master_name }} {{ redis_password }}
+sentinel down-after-milliseconds {{ redis_sentinel_master_name }} 5000
+sentinel failover-timeout {{ redis_sentinel_master_name }} 60000
+sentinel parallel-syncs {{ redis_sentinel_master_name }} 1
+sentinel announce-ip {{ wg_ip }}
+sentinel announce-port {{ redis_sentinel_port }}

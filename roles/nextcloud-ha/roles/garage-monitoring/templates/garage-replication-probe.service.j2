@@ -1,0 +1,12 @@
+[Unit]
+Description=Measure Garage S3 replication visibility latency
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart={{ garage_monitoring_config_dir }}/garage-replication-probe
+User=root
+EnvironmentFile={{ garage_monitoring_config_dir }}/probe.env
+Environment=HOME=/root
+Environment=AWS_EC2_METADATA_DISABLED=true

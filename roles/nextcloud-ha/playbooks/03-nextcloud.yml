@@ -1,0 +1,610 @@
+---
+- name: Deploy Nextcloud HA Docker Compose stack
+  hosts: nextcloud_cluster
+  gather_facts: true
+  become: true
+  any_errors_fatal: true
+
+  pre_tasks:
+    - name: Install AWS CLI for Garage S3 access
+      ansible.builtin.apt:
+        name: awscli
+        state: present
+        update_cache: true
+
+    - name: Validate external HA services
+      ansible.builtin.assert:
+        that:
+          - nextcloud_postgres_host | length > 0
+          - nextcloud_redis_host | length > 0
+          - nextcloud_db_password | length > 0
+          - nextcloud_admin_password | length > 0
+          - garage_s3_endpoint_host | length > 0
+          - garage_s3_key_id | length > 0
+          - garage_s3_secret | length > 0
+          - garage_rpc_secret | length >= 64
+          - garage_admin_token | length > 0
+          - garage_metrics_token | length > 0
+        fail_msg: >-
+          Configure Patroni VIP, shared Redis and Garage S3 credentials in
+          group_vars/vault.yml before deploying the Compose stack.
+
+    - name: Ensure the Nextcloud Docker project is present
+      ansible.builtin.git:
+        repo: "{{ nextcloud_repository_url }}"
+        version: "{{ nextcloud_repository_version }}"
+        dest: "{{ nextcloud_project_path }}"
+        update: false
+        force: false
+
+    - name: Ensure Garage and Nextcloud directories exist
+      ansible.builtin.file:
+        path: "{{ nextcloud_project_path }}/{{ item }}"
+        state: directory
+        mode: '0750'
+      loop:
+        - garage/meta
+        - garage/data
+        - volumes
+
+  tasks:
+    - name: Create AWS CLI configuration directory
+      ansible.builtin.file:
+        path: "{{ garage_aws_cli_config_path | dirname }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Configure AWS CLI Garage profile
+      ansible.builtin.copy:
+        dest: "{{ garage_aws_cli_config_path }}"
+        owner: root
+        group: root
+        mode: '0600'
+        content: |
+          [profile {{ garage_aws_cli_profile }}]
+          region = {{ garage_s3_region }}
+          output = json
+          request_checksum_calculation = when_required
+          response_checksum_validation = when_required
+      no_log: true
+
+    - name: Configure AWS CLI Garage credentials
+      ansible.builtin.copy:
+        dest: "{{ garage_aws_cli_credentials_path }}"
+        owner: root
+        group: root
+        mode: '0600'
+        content: |
+          [{{ garage_aws_cli_profile }}]
+          aws_access_key_id = {{ garage_s3_key_id }}
+          aws_secret_access_key = {{ garage_s3_secret }}
+      no_log: true
+
+    - name: Refresh Nextcloud Docker environment
+      ansible.builtin.template:
+        src: ../templates/nextcloud-garages3.env.j2
+        dest: "{{ nextcloud_project_path }}/.env"
+        mode: '0600'
+
+    - name: Refresh HA Compose override
+      ansible.builtin.template:
+        src: ../templates/docker-compose-garages3.override.yml.j2
+        dest: "{{ nextcloud_project_path }}/docker-compose-garages3.override.yml"
+        mode: '0644'
+
+    - name: Refresh Garage configuration
+      ansible.builtin.template:
+        src: ../templates/garage.toml.j2
+        dest: "{{ nextcloud_project_path }}/garage/garage.toml"
+        mode: '0600'
+
+    - name: Ensure Nextcloud config directory is writable
+      ansible.builtin.file:
+        path: "{{ nextcloud_project_path }}/volumes/nextcloud/config"
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: '0750'
+        recurse: true
+
+    - name: Ensure local Nextcloud data directory exists
+      ansible.builtin.file:
+        path: "{{ nextcloud_project_path }}/volumes/nextcloud/data"
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: '0750'
+
+    - name: Install Nextcloud data directory marker
+      ansible.builtin.copy:
+        content: "# Nextcloud data directory\n"
+        dest: "{{ nextcloud_project_path }}/volumes/nextcloud/data/.ncdata"
+        owner: www-data
+        group: www-data
+        mode: '0640'
+
+    - name: Stop application services on secondary nodes during initialization
+      ansible.builtin.command:
+        cmd: >-
+          docker compose -f {{ nextcloud_compose_file }}
+          -f docker-compose-garages3.override.yml stop app web cron
+        chdir: "{{ nextcloud_project_path }}"
+      when: inventory_hostname != groups['nextcloud_cluster'][0]
+      changed_when: true
+      failed_when: false
+
+    - name: Start Garage service
+      ansible.builtin.command:
+        cmd: >-
+          docker compose -f {{ nextcloud_compose_file }}
+          -f docker-compose-garages3.override.yml up -d garage
+        chdir: "{{ nextcloud_project_path }}"
+      register: nextcloud_compose_up
+      changed_when: true
+
+    - name: Read local Garage node ID
+      ansible.builtin.command:
+        cmd: >-
+          docker compose -f {{ nextcloud_compose_file }}
+          -f docker-compose-garages3.override.yml exec -T garage
+          /garage node id -q
+        chdir: "{{ nextcloud_project_path }}"
+      register: garage_node_id
+      changed_when: false
+      retries: 20
+      delay: 3
+      until: garage_node_id.rc == 0
+
+    - name: Connect Garage cluster peers
+      ansible.builtin.command:
+        cmd: >-
+          docker compose -f {{ nextcloud_compose_file }}
+          -f docker-compose-garages3.override.yml exec -T garage
+          /garage node connect
+          {{ hostvars[item].garage_node_id.stdout | trim }}
+        chdir: "{{ nextcloud_project_path }}"
+      loop: "{{ groups['nextcloud_cluster'] }}"
+      when: item != inventory_hostname
+      changed_when: true
+
+    - name: Read Garage cluster status
+      ansible.builtin.command:
+        cmd: >-
+          docker compose -f {{ nextcloud_compose_file }}
+          -f docker-compose-garages3.override.yml exec -T garage /garage status
+        chdir: "{{ nextcloud_project_path }}"
+      register: garage_status
+      changed_when: false
+      retries: 20
+      delay: 3
+      until: garage_status.rc == 0
+
+    - name: Assign Garage layout role
+      ansible.builtin.command:
+        cmd: >-
+          docker compose -f {{ nextcloud_compose_file }}
+          -f docker-compose-garages3.override.yml exec -T garage /garage
+          layout assign -z {{ garage_zone }} -c {{ garage_capacity }}
+          {{ (garage_node_id.stdout | trim).split('@') | first }}
+        chdir: "{{ nextcloud_project_path }}"
+      when:
+        - garage_node_id.stdout | trim | length > 0
+        - "'NO ROLE ASSIGNED' in garage_status.stdout"
+      changed_when: true
+
+    - name: Apply pending Garage layout changes on the first node
+      ansible.builtin.shell:
+        cmd: |
+          set -eu
+          layout_show=$(docker compose -f {{ nextcloud_compose_file }} \
+            -f docker-compose-garages3.override.yml exec -T garage /garage layout show)
+          current_version=$(printf '%s\n' "$layout_show" | awk '/Current cluster layout version:/ {print $5; exit}')
+          staged_changes=$(printf '%s\n' "$layout_show" | awk '
+            /STAGED ROLE CHANGES/ { in_staged=1; next }
+            /NEW CLUSTER LAYOUT/ { in_staged=0 }
+            in_staged && $1 ~ /^[0-9a-f]+$/ { count++ }
+            END { print count + 0 }
+          ')
+          if [ "$staged_changes" -gt 0 ]; then
+            test -n "$current_version"
+            next_version=$((current_version + 1))
+            docker compose -f {{ nextcloud_compose_file }} \
+              -f docker-compose-garages3.override.yml exec -T garage /garage \
+              layout apply --version "$next_version"
+          else
+            printf '%s\n' 'Garage layout already converged'
+          fi
+        chdir: "{{ nextcloud_project_path }}"
+      when:
+        - inventory_hostname == groups['nextcloud_cluster'][0]
+      register: garage_layout_apply
+      changed_when: "'already converged' not in garage_layout_apply.stdout"
+
+    - name: Validate all Garage nodes are healthy on the first node
+      ansible.builtin.shell:
+        cmd: >-
+          docker compose -f {{ nextcloud_compose_file }}
+          -f docker-compose-garages3.override.yml exec -T garage /garage status
+        chdir: "{{ nextcloud_project_path }}"
+      register: garage_cluster_status
+      changed_when: false
+      retries: 20
+      delay: 5
+      until:
+        - garage_cluster_status.rc == 0
+        - "'FAILED NODES' not in garage_cluster_status.stdout"
+        - garage_cluster_status.stdout | regex_findall('(?m)^[-A-Za-z0-9]+\\s+') | length >= groups['nextcloud_cluster'] | length
+      when: inventory_hostname == groups['nextcloud_cluster'][0]
+
+    - name: Validate the Garage S3 endpoint from every node
+      ansible.builtin.uri:
+        url: "http://{{ garage_s3_endpoint_host }}:{{ garage_s3_api_port }}/"
+        method: GET
+        status_code: [200, 403, 404]
+        timeout: 5
+      register: garage_s3_health
+      retries: 10
+      delay: 3
+      until: garage_s3_health.status in [200, 403, 404]
+
+    - name: Create the Garage bucket on the first node
+      ansible.builtin.command:
+        cmd: >-
+          docker compose -f {{ nextcloud_compose_file }}
+          -f docker-compose-garages3.override.yml exec -T garage /garage
+          bucket create {{ garage_s3_bucket | quote }}
+        chdir: "{{ nextcloud_project_path }}"
+      register: garage_bucket_create
+      when: inventory_hostname == groups['nextcloud_cluster'][0]
+      changed_when: garage_bucket_create.rc == 0
+      failed_when:
+        - garage_bucket_create.rc != 0
+        - "'already exists' not in (garage_bucket_create.stdout ~ garage_bucket_create.stderr)"
+
+    - name: Import the previously generated Garage S3 key
+      ansible.builtin.command:
+        cmd: >-
+          docker compose -f {{ nextcloud_compose_file }}
+          -f docker-compose-garages3.override.yml exec -T garage /garage
+          key import --yes -n {{ garage_s3_key_name | default('nextcloud') | quote }}
+          {{ garage_s3_key_id | quote }} {{ garage_s3_secret | quote }}
+        chdir: "{{ nextcloud_project_path }}"
+      register: garage_key_import
+      no_log: true
+      when: inventory_hostname == groups['nextcloud_cluster'][0]
+      changed_when: garage_key_import.rc == 0
+      failed_when:
+        - garage_key_import.rc != 0
+        - "'already exists' not in (garage_key_import.stdout ~ garage_key_import.stderr)"
+
+    - name: Grant the S3 key access to the Nextcloud bucket
+      ansible.builtin.command:
+        cmd: >-
+          docker compose -f {{ nextcloud_compose_file }}
+          -f docker-compose-garages3.override.yml exec -T garage /garage
+          bucket allow --read --write --owner {{ garage_s3_bucket | quote }}
+          --key {{ garage_s3_key_name | default('nextcloud') | quote }}
+        chdir: "{{ nextcloud_project_path }}"
+      when: inventory_hostname == groups['nextcloud_cluster'][0]
+      changed_when: true
+
+    - name: Validate AWS CLI access to the Garage bucket
+      ansible.builtin.command:
+        cmd: >-
+          aws s3api head-bucket
+          --bucket {{ garage_s3_bucket | quote }}
+          --profile {{ garage_aws_cli_profile | quote }}
+          --endpoint-url {{ garage_aws_cli_endpoint_url | quote }}
+      environment:
+        AWS_CONFIG_FILE: "{{ garage_aws_cli_config_path }}"
+        AWS_SHARED_CREDENTIALS_FILE: "{{ garage_aws_cli_credentials_path }}"
+      register: garage_aws_cli_bucket_check
+      changed_when: false
+      no_log: true
+
+    - name: Build and start application services on the primary node
+      ansible.builtin.command:
+        cmd: >-
+          docker compose -f {{ nextcloud_compose_file }}
+          -f docker-compose-garages3.override.yml up -d --build app web cron
+        chdir: "{{ nextcloud_project_path }}"
+      when: inventory_hostname == groups['nextcloud_cluster'][0]
+      changed_when: true
+
+    - name: Connect the Nextcloud app container to the OnlyOffice network
+      community.docker.docker_network:
+        name: onlyoffice
+        connected:
+          - "{{ nextcloud_project_path | basename }}-app-1"
+        appends: true
+        state: present
+      when: nextcloud_onlyoffice_enabled | bool
+
+    - name: Read primary Nextcloud installation state
+      ansible.builtin.command:
+        cmd: >-
+          docker compose -f {{ nextcloud_compose_file }}
+          -f docker-compose-garages3.override.yml exec -T --user www-data
+          app php occ status
+        chdir: "{{ nextcloud_project_path }}"
+      register: nextcloud_primary_installation_state
+      changed_when: false
+      when: inventory_hostname == groups['nextcloud_cluster'][0]
+
+    - name: Install Nextcloud on the primary node
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ nextcloud_compose_file }}"
+          - -f
+          - docker-compose-garages3.override.yml
+          - exec
+          - -T
+          - --user
+          - www-data
+          - app
+          - sh
+          - -c
+          - >-
+            php occ maintenance:install
+            --database pgsql
+            --database-host "$POSTGRES_HOST"
+            --database-port "$POSTGRES_PORT"
+            --database-name "$POSTGRES_DB"
+            --database-user "$POSTGRES_USER"
+            --database-pass "$POSTGRES_PASSWORD"
+            --admin-user "$NEXTCLOUD_ADMIN_USER"
+            --admin-pass "$NEXTCLOUD_ADMIN_PASSWORD"
+            --admin-email "$NEXTCLOUD_ADMIN_EMAIL"
+        chdir: "{{ nextcloud_project_path }}"
+      no_log: true
+      when:
+        - inventory_hostname == groups['nextcloud_cluster'][0]
+        - "'installed: false' in nextcloud_primary_installation_state.stdout"
+
+    - name: Wait for primary Nextcloud initialization
+      ansible.builtin.command:
+        cmd: >-
+          docker compose -f {{ nextcloud_compose_file }}
+          -f docker-compose-garages3.override.yml exec -T --user www-data
+          app php occ status
+        chdir: "{{ nextcloud_project_path }}"
+      register: nextcloud_occ_status
+      changed_when: false
+      retries: 30
+      delay: 10
+      until:
+        - nextcloud_occ_status.rc == 0
+        - "'installed: true' in nextcloud_occ_status.stdout"
+      when: inventory_hostname == groups['nextcloud_cluster'][0]
+
+    - name: Enforce Nextcloud trusted domains from deployment variables
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ nextcloud_compose_file }}"
+          - -f
+          - docker-compose-garages3.override.yml
+          - exec
+          - -T
+          - --user
+          - www-data
+          - app
+          - php
+          - occ
+          - config:system:set
+          - trusted_domains
+          - "0"
+          - --value={{ nextcloud_domain }}
+        chdir: "{{ nextcloud_project_path }}"
+      register: nextcloud_trusted_domain_config
+      changed_when: >-
+        'set to string' in (nextcloud_trusted_domain_config.stdout | lower)
+      when: inventory_hostname == groups['nextcloud_cluster'][0]
+
+    - name: Allow the internal Nextcloud service hostname for OnlyOffice
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ nextcloud_compose_file }}"
+          - -f
+          - docker-compose-garages3.override.yml
+          - exec
+          - -T
+          - --user
+          - www-data
+          - app
+          - php
+          - occ
+          - config:system:set
+          - trusted_domains
+          - "1"
+          - --value=web
+        chdir: "{{ nextcloud_project_path }}"
+      register: nextcloud_trusted_domain_internal_config
+      changed_when: >-
+        'set to string' in (nextcloud_trusted_domain_internal_config.stdout | lower)
+      when:
+        - inventory_hostname == groups['nextcloud_cluster'][0]
+        - nextcloud_onlyoffice_enabled | bool
+
+    - name: Configure APCu local cache
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ nextcloud_compose_file }}"
+          - -f
+          - docker-compose-garages3.override.yml
+          - exec
+          - -T
+          - --user
+          - www-data
+          - app
+          - php
+          - occ
+          - config:system:set
+          - memcache.local
+          - --value=\OC\Memcache\APCu
+        chdir: "{{ nextcloud_project_path }}"
+      register: nextcloud_local_cache_config
+      changed_when: "'set to string' in (nextcloud_local_cache_config.stdout | lower)"
+      when: inventory_hostname == groups['nextcloud_cluster'][0]
+
+    - name: Configure default phone region
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ nextcloud_compose_file }}"
+          - -f
+          - docker-compose-garages3.override.yml
+          - exec
+          - -T
+          - --user
+          - www-data
+          - app
+          - php
+          - occ
+          - config:system:set
+          - default_phone_region
+          - --value=BR
+        chdir: "{{ nextcloud_project_path }}"
+      register: nextcloud_phone_region_config
+      changed_when: "'set to string' in (nextcloud_phone_region_config.stdout | lower)"
+      when: inventory_hostname == groups['nextcloud_cluster'][0]
+
+    - name: Configure maintenance window start
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ nextcloud_compose_file }}"
+          - -f
+          - docker-compose-garages3.override.yml
+          - exec
+          - -T
+          - --user
+          - www-data
+          - app
+          - php
+          - occ
+          - config:system:set
+          - maintenance_window_start
+          - --type
+          - integer
+          - --value=1
+        chdir: "{{ nextcloud_project_path }}"
+      register: nextcloud_maintenance_window_config
+      changed_when: "'set to integer' in (nextcloud_maintenance_window_config.stdout | lower)"
+      when: inventory_hostname == groups['nextcloud_cluster'][0]
+
+    - name: Read primary Nextcloud configuration
+      ansible.builtin.slurp:
+        src: "{{ nextcloud_project_path }}/volumes/nextcloud/config/config.php"
+      delegate_to: "{{ groups['nextcloud_cluster'][0] }}"
+      run_once: true
+      register: nextcloud_primary_config
+      no_log: true
+
+    - name: Synchronize primary Nextcloud configuration to secondary nodes
+      ansible.builtin.copy:
+        content: "{{ nextcloud_primary_config.content | b64decode }}"
+        dest: "{{ nextcloud_project_path }}/volumes/nextcloud/config/config.php"
+        owner: www-data
+        group: www-data
+        mode: '0640'
+      when: inventory_hostname != groups['nextcloud_cluster'][0]
+      no_log: true
+
+    - name: Build and start application services on secondary nodes
+      ansible.builtin.command:
+        cmd: >-
+          docker compose -f {{ nextcloud_compose_file }}
+          -f docker-compose-garages3.override.yml up -d --build app web cron
+        chdir: "{{ nextcloud_project_path }}"
+      when: inventory_hostname != groups['nextcloud_cluster'][0]
+      changed_when: true
+
+    - name: Connect the Nextcloud app container to the OnlyOffice network
+      community.docker.docker_network:
+        name: onlyoffice
+        connected:
+          - "{{ nextcloud_project_path | basename }}-app-1"
+        appends: true
+        state: present
+      when: nextcloud_onlyoffice_enabled | bool
+
+    - name: Wait for all application services
+      ansible.builtin.command:
+        cmd: >-
+          docker compose -f {{ nextcloud_compose_file }}
+          -f docker-compose-garages3.override.yml exec -T --user www-data
+          app php occ status
+        chdir: "{{ nextcloud_project_path }}"
+      register: nextcloud_occ_status_all
+      changed_when: false
+      retries: 30
+      delay: 10
+      until:
+        - nextcloud_occ_status_all.rc == 0
+        - "'installed: true' in nextcloud_occ_status_all.stdout"
+
+    - name: Ensure Nextcloud code tree is readable by the web server
+      ansible.builtin.shell:
+        cmd: |
+          set -eu
+          nextcloud_root="{{ nextcloud_project_path }}/volumes/nextcloud"
+          # The web container runs nginx as UID 101 (not www-data). With the
+          # volume root at 0750 that user cannot traverse the tree, so nginx
+          # fails with "stat() failed (13: Permission denied)" and returns 404.
+          # Make every code directory world-traversable and every file
+          # world-readable, while keeping the config/ and data/ directories
+          # restricted to www-data (they hold config.php secrets and user data).
+          chmod 0755 "$nextcloud_root"
+          find "$nextcloud_root" -mindepth 1 \
+            \( -path "$nextcloud_root/config" -o -path "$nextcloud_root/data" \) -prune -o \
+            -exec chmod a+rX {} +
+      changed_when: false
+      tags: [permissions, nextcloud]
+
+    - name: Verify the configured database host
+      ansible.builtin.command:
+        cmd: >-
+          docker compose -f {{ nextcloud_compose_file }}
+          -f docker-compose-garages3.override.yml exec -T --user www-data
+          app php occ config:system:get dbhost
+        chdir: "{{ nextcloud_project_path }}"
+      register: nextcloud_dbhost
+      changed_when: false
+      failed_when: nextcloud_dbhost.stdout | trim not in [nextcloud_postgres_host, nextcloud_postgres_host ~ ':' ~ nextcloud_postgres_port|string]
+
+    - name: Verify the configured object storage
+      ansible.builtin.command:
+        cmd: >-
+          docker compose -f {{ nextcloud_compose_file }}
+          -f docker-compose-garages3.override.yml exec -T --user www-data
+          app php occ config:system:get objectstore
+        chdir: "{{ nextcloud_project_path }}"
+      register: nextcloud_objectstore
+      changed_when: false
+      failed_when: nextcloud_objectstore.rc != 0
+
+    - name: Show Nextcloud HA deployment summary
+      ansible.builtin.debug:
+        msg:
+          - "Compose project: {{ nextcloud_project_path }}"
+          - "PostgreSQL VIP: {{ nextcloud_postgres_host }}:{{ nextcloud_postgres_port }}"
+          - "Redis: {{ nextcloud_redis_host }}:{{ nextcloud_redis_port }}"
+          - "Garage S3: {{ garage_s3_endpoint_host }}:{{ garage_s3_api_port }}"

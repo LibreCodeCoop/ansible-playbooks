@@ -1,0 +1,13 @@
+---
+ip: "{{ vip_address }}"
+netmask: "{{ vip_netmask }}"
+interface: "{{ wireguard_interface }}"
+trigger-key: /leader
+trigger-value: "200"
+manager-type: basic
+dcs-type: patroni
+dcs-endpoints:
+  - "http://127.0.0.1:{{ patroni_api_port }}"
+interval: 1000
+retry-after: 250
+retry-num: 5

@@ -1,0 +1,111 @@
+---
+- name: Deploy WireGuard Mesh Network
+  hosts: nextcloud_cluster
+  gather_facts: true
+  become: true
+  
+  tasks:
+    - name: Install WireGuard and dependencies
+      apt:
+        name:
+          - wireguard
+          - wireguard-tools
+          - iptables
+          - jq
+        state: present
+        update_cache: yes
+    
+    - name: Enable IP forwarding permanently
+      lineinfile:
+        path: /etc/sysctl.conf
+        line: "net.ipv4.ip_forward=1"
+        create: yes
+      notify: Reload sysctl
+    
+    - name: Enable IP forwarding immediately
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: "1"
+        sysctl_set: yes
+        state: present
+    
+    - name: Create WireGuard directory
+      file:
+        path: /etc/wireguard
+        state: directory
+        mode: '0755'
+    
+    - name: Check WireGuard private key
+      ansible.builtin.stat:
+        path: /etc/wireguard/privatekey
+      register: wg_private_key_file
+
+    - name: Generate WireGuard private key
+      ansible.builtin.command: wg genkey
+      register: wg_generated_private_key
+      no_log: true
+      when: not wg_private_key_file.stat.exists
+    
+    - name: Save private key securely
+      copy:
+        content: "{{ wg_generated_private_key.stdout }}\n"
+        dest: /etc/wireguard/privatekey
+        mode: '0600'
+      no_log: true
+      when: not wg_private_key_file.stat.exists
+
+    - name: Read WireGuard private key
+      ansible.builtin.slurp:
+        src: /etc/wireguard/privatekey
+      register: wg_private_key_raw
+      no_log: true
+
+    - name: Set WireGuard private key
+      ansible.builtin.set_fact:
+        wg_private_key_value: "{{ wg_private_key_raw.content | b64decode | trim }}"
+      no_log: true
+    
+    - name: Generate and save public key
+      shell: cat /etc/wireguard/privatekey | wg pubkey
+      register: wg_public_key
+      changed_when: false
+
+    - name: Set WireGuard public key fact
+      ansible.builtin.set_fact:
+        wg_public_key_value: "{{ wg_public_key.stdout | trim }}"
+
+    - name: Save public key
+      copy:
+        content: "{{ wg_public_key_value }}"
+        dest: /etc/wireguard/publickey
+        mode: '0644'
+    
+    - name: Generate wg0.conf from template
+      template:
+        src: ../roles/wireguard/templates/wg0.conf.j2
+        dest: /etc/wireguard/wg0.conf
+        mode: '0600'
+        backup: yes
+
+    - name: Enable and start WireGuard
+      systemd:
+        name: wg-quick@wg0
+        enabled: yes
+        state: restarted
+
+    - name: Wait for WireGuard interface
+      wait_for:
+        path: /sys/class/net/wg0
+        timeout: 30
+    
+    - name: Configure firewall for WireGuard
+      ufw:
+        rule: allow
+        port: "{{ wireguard_port }}"
+        proto: udp
+        comment: "WireGuard VPN"
+      ignore_errors: yes
+  
+  handlers:
+    - name: Reload sysctl
+      command: sysctl -p

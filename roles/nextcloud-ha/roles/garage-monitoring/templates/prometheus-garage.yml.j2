@@ -1,0 +1,22 @@
+scrape_configs:
+  - job_name: garage
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: {{ garage_monitoring_config_dir }}/metrics.token
+    static_configs:
+{% for host in groups['nextcloud_cluster'] %}
+      - targets: ["{{ hostvars[host].wg_ip }}:{{ garage_monitoring_metrics_port }}"]
+        labels:
+          cluster: nextcloud
+          node: {{ host }}
+{% endfor %}
+
+  - job_name: garage-replication-probe
+    static_configs:
+{% for host in groups['nextcloud_cluster'] %}
+      - targets: ["{{ hostvars[host].wg_ip }}:{{ node_exporter_port | default(9100) }}"]
+        labels:
+          cluster: nextcloud
+          node: {{ host }}
+{% endfor %}

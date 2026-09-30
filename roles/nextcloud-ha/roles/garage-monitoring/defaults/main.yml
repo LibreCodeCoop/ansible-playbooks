@@ -1,0 +1,22 @@
+---
+garage_monitoring_enabled: true
+garage_monitoring_config_dir: /etc/garage-monitoring
+garage_monitoring_metrics_dir: /var/lib/prometheus/node-exporter
+garage_monitoring_metrics_file: garage_replication.prom
+garage_monitoring_probe_bucket: garage-monitoring-probes
+garage_monitoring_probe_prefix: replication
+garage_monitoring_probe_size_bytes: 1024
+garage_monitoring_probe_timeout_seconds: 30
+garage_monitoring_probe_interval_seconds: 60
+garage_monitoring_s3_region: "{{ garage_s3_region | default('garage') }}"
+garage_monitoring_s3_key_id: "{{ garage_s3_key_id }}"
+garage_monitoring_s3_secret: "{{ garage_s3_secret }}"
+garage_monitoring_local_endpoint: "http://127.0.0.1:{{ garage_s3_api_port | default(3900) }}"
+garage_monitoring_peer_endpoint: "http://{{ hostvars[groups['nextcloud_cluster'] | difference([inventory_hostname]) | first].wg_ip }}:{{ garage_s3_api_port | default(3900) }}"
+garage_monitoring_node: "{{ inventory_hostname }}"
+garage_monitoring_metrics_token: "{{ garage_metrics_token }}"
+garage_monitoring_metrics_port: "{{ garage_admin_port | default(3903) }}"
+garage_monitoring_prometheus_config_path: /etc/garage-monitoring/prometheus.yml
+garage_monitoring_project_path: /opt/nextcloud-docker
+garage_monitoring_compose_file: docker-compose-garages3.yml
+garage_monitoring_key_name: "{{ garage_s3_key_name | default('nextcloud') }}"

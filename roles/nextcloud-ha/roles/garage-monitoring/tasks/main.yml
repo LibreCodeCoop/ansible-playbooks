@@ -1,0 +1,129 @@
+---
+- name: Install Garage monitoring dependencies
+  ansible.builtin.apt:
+    name:
+      - awscli
+      - prometheus-node-exporter
+    state: present
+    update_cache: true
+  when: garage_monitoring_enabled | bool
+
+- name: Create the dedicated Garage monitoring bucket
+  ansible.builtin.command:
+    cmd: >-
+      docker compose -f {{ garage_monitoring_compose_file }}
+      -f docker-compose-garages3.override.yml exec -T garage /garage
+      bucket create {{ garage_monitoring_probe_bucket | quote }}
+    chdir: "{{ garage_monitoring_project_path }}"
+  register: garage_monitoring_bucket_create
+  changed_when: garage_monitoring_bucket_create.rc == 0
+  failed_when:
+    - garage_monitoring_bucket_create.rc != 0
+    - "'already exists' not in (garage_monitoring_bucket_create.stdout ~ garage_monitoring_bucket_create.stderr)"
+  when:
+    - garage_monitoring_enabled | bool
+    - inventory_hostname == groups['nextcloud_cluster'][0]
+
+- name: Grant the Garage monitoring key access to the probe bucket
+  ansible.builtin.command:
+    cmd: >-
+      docker compose -f {{ garage_monitoring_compose_file }}
+      -f docker-compose-garages3.override.yml exec -T garage /garage
+      bucket allow --read --write {{ garage_monitoring_probe_bucket | quote }}
+      --key {{ garage_monitoring_key_name | quote }}
+    chdir: "{{ garage_monitoring_project_path }}"
+  changed_when: true
+  when:
+    - garage_monitoring_enabled | bool
+    - inventory_hostname == groups['nextcloud_cluster'][0]
+
+- name: Create Garage monitoring directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner | default('root') }}"
+    group: "{{ item.group | default('root') }}"
+    mode: "{{ item.mode | default('0755') }}"
+  loop:
+    - path: "{{ garage_monitoring_config_dir }}"
+      mode: '0750'
+    - path: "{{ garage_monitoring_metrics_dir }}"
+      owner: prometheus
+      group: prometheus
+      mode: '0755'
+  when: garage_monitoring_enabled | bool
+
+- name: Install Garage probe environment
+  ansible.builtin.template:
+    src: probe.env.j2
+    dest: "{{ garage_monitoring_config_dir }}/probe.env"
+    owner: root
+    group: root
+    mode: '0600'
+  no_log: true
+  when: garage_monitoring_enabled | bool
+
+- name: Install Garage replication probe
+  ansible.builtin.template:
+    src: garage-replication-probe.sh.j2
+    dest: "{{ garage_monitoring_config_dir }}/garage-replication-probe"
+    owner: root
+    group: root
+    mode: '0755'
+  when: garage_monitoring_enabled | bool
+
+- name: Install Garage replication probe service
+  ansible.builtin.template:
+    src: garage-replication-probe.service.j2
+    dest: /etc/systemd/system/garage-replication-probe.service
+    owner: root
+    group: root
+    mode: '0644'
+  notify: Reload systemd
+  when: garage_monitoring_enabled | bool
+
+- name: Install Garage replication probe timer
+  ansible.builtin.template:
+    src: garage-replication-probe.timer.j2
+    dest: /etc/systemd/system/garage-replication-probe.timer
+    owner: root
+    group: root
+    mode: '0644'
+  notify: Reload systemd
+  when: garage_monitoring_enabled | bool
+
+- name: Install Prometheus Garage scrape configuration
+  ansible.builtin.template:
+    src: prometheus-garage.yml.j2
+    dest: "{{ garage_monitoring_prometheus_config_path }}"
+    owner: root
+    group: root
+    mode: '0640'
+  when: garage_monitoring_enabled | bool
+
+- name: Install Garage metrics token for Prometheus
+  ansible.builtin.copy:
+    content: "{{ garage_monitoring_metrics_token }}\n"
+    dest: "{{ garage_monitoring_config_dir }}/metrics.token"
+    owner: root
+    group: root
+    mode: '0600'
+  no_log: true
+  when: garage_monitoring_enabled | bool
+
+- name: Enable Node Exporter
+  ansible.builtin.systemd:
+    name: prometheus-node-exporter
+    enabled: true
+    state: started
+  when: garage_monitoring_enabled | bool
+
+- name: Apply Garage monitoring systemd units
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable Garage replication probe timer
+  ansible.builtin.systemd:
+    name: garage-replication-probe.timer
+    enabled: true
+    state: started
+  when: garage_monitoring_enabled | bool

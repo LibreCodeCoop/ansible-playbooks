@@ -1,0 +1,159 @@
+---
+- name: Prepare Docker host for Nextcloud HA
+  hosts: nextcloud_cluster
+  gather_facts: true
+  become: true
+
+  tasks:
+    - name: Install Docker Compose host dependencies
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - git
+          - rsync
+        state: present
+        update_cache: true
+
+    - name: Verify Docker Compose is available
+      ansible.builtin.command: docker compose version
+      changed_when: false
+
+    - name: Enable Docker
+      ansible.builtin.systemd:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: Install NFS packages for shared ACME challenge storage
+      ansible.builtin.apt:
+        name: "{{ (inventory_hostname == acme_shared_host) | ternary('nfs-kernel-server', 'nfs-common') }}"
+        state: present
+        update_cache: true
+
+    - name: Ensure shared ACME challenge directory exists on the NFS server
+      ansible.builtin.file:
+        path: "{{ acme_nfs_export_path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      when: inventory_hostname == acme_shared_host
+
+    - name: Export shared ACME challenge directory over WireGuard
+      ansible.builtin.file:
+        path: /etc/exports.d
+        state: directory
+        mode: '0755'
+      when: inventory_hostname == acme_shared_host
+
+#    - name: Configure shared ACME challenge export over WireGuard
+#      ansible.builtin.copy:
+#        dest: /etc/exports.d/nextcloud-acme.exports
+#        mode: '0644'
+#        content: "{{ acme_nfs_export_path }} {{ hostvars[groups['nextcloud_cluster'][1]].wg_ip }}(rw,sync,no_subtree_check,no_root_squash)\n"
+#      when: inventory_hostname == acme_shared_host
+#      notify: Reload NFS exports
+
+    - name: Configure shared ACME challenge export over WireGuard
+      ansible.builtin.copy:
+        dest: /etc/exports.d/nextcloud-acme.exports
+        mode: '0644'
+        content: |
+          {{ acme_nfs_export_path }} {% for host in groups['nextcloud_cluster'] %}{% if host != acme_shared_host and hostvars[host].wg_ip is defined %}{{ hostvars[host].wg_ip }}(rw,sync,no_subtree_check,no_root_squash) {% endif %}{% endfor %}
+      when: inventory_hostname == acme_shared_host
+      notify: Reload NFS exports
+
+    - name: Enable NFS server
+      ansible.builtin.systemd:
+        name: nfs-server
+        enabled: true
+        state: started
+      when: inventory_hostname == acme_shared_host
+
+    - name: Apply NFS export before mounting it on secondary nodes
+      ansible.builtin.meta: flush_handlers
+
+    - name: Stop nginx-proxy before mounting shared ACME storage
+      community.docker.docker_compose_v2:
+        project_src: /root/projects/nginx-proxy
+        state: stopped
+      when: inventory_hostname != acme_shared_host
+      failed_when: false
+
+    - name: Mount shared ACME challenge directory on secondary nodes
+      ansible.posix.mount:
+        path: "{{ acme_shared_path }}"
+        src: "{{ hostvars[acme_shared_host].wg_ip }}:{{ acme_nfs_export_path }}"
+        fstype: nfs4
+        opts: _netdev,vers=4,proto=tcp
+        state: mounted
+      when: inventory_hostname != acme_shared_host
+
+    - name: Ensure reverse-proxy Docker network exists
+      community.docker.docker_network:
+        name: reverse-proxy
+        state: present
+
+    - name: Prepare nginx proxy overrides
+      ansible.builtin.set_fact:
+        nginx_proxy_vhost_overrides: "{{ [{'filename': nextcloud_domain, 'content': nextcloud_onlyoffice_nginx_override_content}] if nextcloud_onlyoffice_enabled | bool else [] }}"
+
+    - name: Deploy nginx reverse proxy and ACME companion
+      ansible.builtin.include_role:
+        name: nginx-proxy
+
+    - name: Checkout the Nextcloud Docker project
+      ansible.builtin.git:
+        repo: "{{ nextcloud_repository_url }}"
+        version: "{{ nextcloud_repository_version }}"
+        dest: "{{ nextcloud_project_path }}"
+        update: false
+        force: false
+      register: nextcloud_repository
+
+    - name: Ensure local project directories exist
+      ansible.builtin.file:
+        path: "{{ nextcloud_project_path }}/{{ item }}"
+        state: directory
+        mode: '0750'
+      loop:
+        - garage/meta
+        - garage/data
+        - volumes
+
+    - name: Deploy Nextcloud Docker environment
+      ansible.builtin.template:
+        src: ../templates/nextcloud-garages3.env.j2
+        dest: "{{ nextcloud_project_path }}/.env"
+        mode: '0600'
+
+    - name: Deploy the HA Compose override
+      ansible.builtin.template:
+        src: ../templates/docker-compose-garages3.override.yml.j2
+        dest: "{{ nextcloud_project_path }}/docker-compose-garages3.override.yml"
+        mode: '0644'
+
+    - name: Deploy Garage configuration used by the Compose service
+      ansible.builtin.template:
+        src: ../templates/garage.toml.j2
+        dest: "{{ nextcloud_project_path }}/garage/garage.toml"
+        mode: '0600'
+
+    - name: Validate the upstream Garage S3 Compose file and HA override
+      ansible.builtin.command:
+        cmd: >-
+          docker compose -f {{ nextcloud_compose_file }}
+          -f docker-compose-garages3.override.yml config
+        chdir: "{{ nextcloud_project_path }}"
+      changed_when: false
+
+#  handlers:
+#    - name: Reload NFS exports
+#      ansible.builtin.command: exportfs -ra
+#      changed_when: true
+
+  handlers:
+    - name: Reload NFS exports
+      ansible.builtin.systemd:
+        name: nfs-server
+        state: restarted

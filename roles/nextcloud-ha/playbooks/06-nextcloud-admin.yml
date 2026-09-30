@@ -1,0 +1,240 @@
+---
+- name: Apply Nextcloud administrative configuration
+  hosts: nextcloud_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+
+  vars_files:
+    - ../group_vars/all.yml
+
+  vars:
+    nextcloud_occ_command:
+      - docker
+      - compose
+      - -f
+      - "{{ nextcloud_compose_file }}"
+      - -f
+      - docker-compose-garages3.override.yml
+      - exec
+      - -T
+      - --user
+      - www-data
+      - app
+      - php
+      - occ
+    onlyoffice_document_server_url: "https://{{ nextcloud_domain }}{{ nextcloud_onlyoffice_url_path }}"
+    onlyoffice_document_server_internal_url: "http://onlyoffice/"
+    onlyoffice_storage_url: "http://web/"
+    onlyoffice_jwt_secret_effective: "{{ lookup('ansible.builtin.password', playbook_dir ~ '/../.onlyoffice_secrets/onlyoffice_jwt_secret length=48 chars=ascii_letters,digits') }}"
+    nextcloud_public_system_config:
+      - key: memcache.local
+        type: string
+        value: '\OC\Memcache\APCu'
+      - key: memcache.distributed
+        type: string
+        value: '\OC\Memcache\Redis'
+      - key: memcache.locking
+        type: string
+        value: '\OC\Memcache\Redis'
+      - key: redis
+        path: host
+        type: string
+        value: "{{ nextcloud_redis_host }}"
+      - key: redis
+        path: port
+        type: integer
+        value: "{{ nextcloud_redis_port }}"
+      - key: default_phone_region
+        type: string
+        value: "{{ nextcloud_default_phone_region }}"
+      - key: maintenance_window_start
+        type: integer
+        value: "{{ nextcloud_maintenance_window_start }}"
+      - key: overwriteprotocol
+        type: string
+        value: "{{ nextcloud_overwrite_protocol }}"
+      - key: overwrite.cli.url
+        type: string
+        value: "{{ nextcloud_overwrite_protocol }}://{{ nextcloud_domain }}"
+      - key: serverid
+        type: integer
+        value: "{{ nextcloud_server_id }}"
+    nextcloud_onlyoffice_app_config:
+      - key: DocumentServerUrl
+        type: string
+        value: "{{ onlyoffice_document_server_url }}"
+      - key: DocumentServerInternalUrl
+        type: string
+        value: "{{ onlyoffice_document_server_internal_url }}"
+      - key: StorageUrl
+        type: string
+        value: "{{ onlyoffice_storage_url }}"
+      - key: jwt_secret
+        type: string
+        value: "{{ onlyoffice_jwt_secret_effective }}"
+
+  pre_tasks:
+    - name: Validate administrative configuration
+      ansible.builtin.assert:
+        that:
+          - nextcloud_server_id | int >= 0
+          - nextcloud_server_id | int <= 511
+          - nextcloud_trusted_proxies | length > 0
+          - nextcloud_forwarded_for_headers | length > 0
+          - nextcloud_maintenance_window_start | int >= 0
+          - nextcloud_maintenance_window_start | int <= 23
+
+  tasks:
+    - name: Configure public Nextcloud system values
+      ansible.builtin.command:
+        argv: >-
+          {{
+            nextcloud_occ_command
+            + ['config:system:set', item.key]
+            + ([item.path] if item.path is defined else [])
+            + ['--type=' ~ item.type, '--value=' ~ (item.value | string)]
+          }}
+        chdir: "{{ nextcloud_project_path }}"
+      loop: "{{ nextcloud_public_system_config }}"
+      loop_control:
+        label: "{{ item.key }}{{ ' ' ~ item.path if item.path is defined else '' }}"
+      register: nextcloud_public_config_result
+      changed_when: "'set to' in (nextcloud_public_config_result.stdout | lower)"
+
+    - name: Configure Redis password from the application environment
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ nextcloud_compose_file }}"
+          - -f
+          - docker-compose-garages3.override.yml
+          - exec
+          - -T
+          - --user
+          - www-data
+          - app
+          - sh
+          - -c
+          - 'php occ config:system:set redis password --type=string --value="$REDIS_HOST_PASSWORD"'
+        chdir: "{{ nextcloud_project_path }}"
+      register: nextcloud_redis_password_result
+      changed_when: "'set to' in (nextcloud_redis_password_result.stdout | lower)"
+      no_log: true
+
+    - name: Configure trusted reverse proxy networks
+      ansible.builtin.command:
+        argv: "{{ nextcloud_occ_command + ['config:system:set', 'trusted_proxies', proxy_index | string, '--type=string', '--value=' ~ item] }}"
+        chdir: "{{ nextcloud_project_path }}"
+      loop: "{{ nextcloud_trusted_proxies }}"
+      loop_control:
+        index_var: proxy_index
+      register: nextcloud_trusted_proxy_result
+      changed_when: "'set to' in (nextcloud_trusted_proxy_result.stdout | lower)"
+
+    - name: Configure forwarded-for headers
+      ansible.builtin.command:
+        argv: "{{ nextcloud_occ_command + ['config:system:set', 'forwarded_for_headers', header_index | string, '--type=string', '--value=' ~ item] }}"
+        chdir: "{{ nextcloud_project_path }}"
+      loop: "{{ nextcloud_forwarded_for_headers }}"
+      loop_control:
+        index_var: header_index
+      register: nextcloud_forwarded_header_result
+      changed_when: "'set to' in (nextcloud_forwarded_header_result.stdout | lower)"
+
+    - name: Check whether OnlyOffice app is installed
+      ansible.builtin.command:
+        argv: "{{ nextcloud_occ_command + ['app:list', '--output=json'] }}"
+        chdir: "{{ nextcloud_project_path }}"
+      register: nextcloud_onlyoffice_app_list
+      changed_when: false
+      when:
+        - nextcloud_onlyoffice_enabled | bool
+        - not ansible_check_mode
+
+    - name: Install OnlyOffice app when missing
+      ansible.builtin.command:
+        argv: "{{ nextcloud_occ_command + ['app:install', 'onlyoffice'] }}"
+        chdir: "{{ nextcloud_project_path }}"
+      register: nextcloud_onlyoffice_app_install
+      changed_when: "'installed' in (nextcloud_onlyoffice_app_install.stdout | lower)"
+      when:
+        - nextcloud_onlyoffice_enabled | bool
+        - not ansible_check_mode
+        - nextcloud_onlyoffice_app_list is defined
+        - "'onlyoffice' not in ((nextcloud_onlyoffice_app_list.stdout | from_json).enabled | default({}))"
+
+    - name: Enable OnlyOffice app
+      ansible.builtin.command:
+        argv: "{{ nextcloud_occ_command + ['app:enable', 'onlyoffice'] }}"
+        chdir: "{{ nextcloud_project_path }}"
+      register: nextcloud_onlyoffice_app_enable
+      changed_when: "'enabled' in (nextcloud_onlyoffice_app_enable.stdout | lower)"
+      when:
+        - nextcloud_onlyoffice_enabled | bool
+        - not ansible_check_mode
+        - nextcloud_onlyoffice_app_list is defined
+        - "'onlyoffice' not in ((nextcloud_onlyoffice_app_list.stdout | from_json).enabled | default({})) or nextcloud_onlyoffice_app_install is changed"
+
+    - name: Configure OnlyOffice app values
+      ansible.builtin.command:
+        argv: >-
+          {{
+            nextcloud_occ_command
+            + ['config:app:set', 'onlyoffice', item.key]
+            + ['--type=' ~ item.type, '--value=' ~ (item.value | string)]
+          }}
+        chdir: "{{ nextcloud_project_path }}"
+      loop: "{{ nextcloud_onlyoffice_app_config }}"
+      loop_control:
+        label: "{{ item.key }}"
+      register: nextcloud_onlyoffice_config_result
+      changed_when: "'set to' in (nextcloud_onlyoffice_config_result.stdout | lower)"
+      when:
+        - nextcloud_onlyoffice_enabled | bool
+      no_log: true
+
+    - name: Check whether AppAPI is enabled
+      ansible.builtin.command:
+        argv: "{{ nextcloud_occ_command + ['app:list', '--output=json'] }}"
+        chdir: "{{ nextcloud_project_path }}"
+      register: nextcloud_app_list
+      changed_when: false
+      when:
+        - not ansible_check_mode
+        - inventory_hostname == groups['nextcloud_cluster'][0]
+        - nextcloud_disable_unused_app_api | bool
+
+    - name: Disable AppAPI when External Apps are not used
+      ansible.builtin.command:
+        argv: "{{ nextcloud_occ_command + ['app:disable', 'app_api'] }}"
+        chdir: "{{ nextcloud_project_path }}"
+      register: nextcloud_disable_app_api_result
+      changed_when: "'disabled' in (nextcloud_disable_app_api_result.stdout | lower)"
+      when:
+        - not ansible_check_mode
+        - inventory_hostname == groups['nextcloud_cluster'][0]
+        - nextcloud_disable_unused_app_api | bool
+        - "'app_api' in ((nextcloud_app_list.stdout | from_json).enabled | default({}))"
+
+    - name: Enforce two-factor authentication
+      ansible.builtin.command:
+        argv: "{{ nextcloud_occ_command + ['twofactorauth:enforce', '--on'] }}"
+        chdir: "{{ nextcloud_project_path }}"
+      register: nextcloud_twofactor_result
+      changed_when: "'enforced' in (nextcloud_twofactor_result.stdout | lower)"
+      when:
+        - inventory_hostname == groups['nextcloud_cluster'][0]
+        - nextcloud_enforce_twofactor | bool
+
+    - name: Run expensive mimetype migrations after an upgrade
+      ansible.builtin.command:
+        argv: "{{ nextcloud_occ_command + ['maintenance:repair', '--include-expensive'] }}"
+        chdir: "{{ nextcloud_project_path }}"
+      register: nextcloud_expensive_repair
+      changed_when: true
+      when:
+        - inventory_hostname == groups['nextcloud_cluster'][0]
+        - nextcloud_run_expensive_mimetype_migrations | bool

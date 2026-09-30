@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+
+sentinel_host='127.0.0.1'
+sentinel_port='{{ redis_sentinel_port }}'
+master_name='{{ redis_sentinel_master_name }}'
+server_port='{{ redis_server_port }}'
+
+master_ip=$(
+  redis-cli -h "$sentinel_host" -p "$sentinel_port" \
+    sentinel get-master-addr-by-name "$master_name" 2>/dev/null \
+    | sed -n '1p'
+)
+
+[ -n "$master_ip" ] || exit 1
+
+exec socat STDIO TCP:"$master_ip":"$server_port"

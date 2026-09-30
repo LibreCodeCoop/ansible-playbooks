@@ -1,0 +1,188 @@
+---
+- name: Deploy Firewall Rules
+  hosts: nextcloud_cluster
+  gather_facts: true
+  become: true
+
+  tasks:
+    - name: Ensure UFW is installed
+      apt:
+        name:
+          - ufw
+        state: present
+        update_cache: yes
+
+    - name: Set default deny incoming
+      ufw:
+        direction: incoming
+        policy: deny
+      ignore_errors: yes
+
+    - name: Set default allow outgoing
+      ufw:
+        direction: outgoing
+        policy: allow
+      ignore_errors: yes
+
+    - name: Allow SSH from restricted CIDR when configured
+      ufw:
+        rule: allow
+        port: "{{ ssh_service_port }}"
+        proto: tcp
+        from_ip: "{{ ssh_allowed_cidr }}"
+      when: ssh_allowed_cidr is defined and ssh_allowed_cidr | length > 0
+      ignore_errors: yes
+
+    - name: Allow SSH from anywhere when no restriction is configured
+      ufw:
+        rule: allow
+        port: "{{ ssh_service_port }}"
+        proto: tcp
+      when: ssh_allowed_cidr is not defined or ssh_allowed_cidr | length == 0
+      ignore_errors: yes
+
+    - name: Allow HTTP
+      ufw:
+        rule: allow
+        port: "80"
+        proto: tcp
+      ignore_errors: yes
+
+    - name: Allow HTTPS
+      ufw:
+        rule: allow
+        port: "443"
+        proto: tcp
+      ignore_errors: yes
+
+    - name: Allow WireGuard
+      ufw:
+        rule: allow
+        port: "{{ wireguard_port }}"
+        proto: udp
+      ignore_errors: yes
+
+    - name: Allow PostgreSQL from WireGuard network
+      ufw:
+        rule: allow
+        port: "{{ postgres_port }}"
+        proto: tcp
+        from_ip: "{{ wireguard_network }}"
+      ignore_errors: yes
+
+    - name: Allow PostgreSQL from private Docker networks
+      ufw:
+        rule: allow
+        port: "{{ postgres_port }}"
+        proto: tcp
+        from_ip: "{{ nextcloud_docker_network_cidr }}"
+      ignore_errors: yes
+
+    - name: Allow Patroni API from WireGuard network
+      ufw:
+        rule: allow
+        port: "{{ patroni_api_port }}"
+        proto: tcp
+        from_ip: "{{ wireguard_network }}"
+      ignore_errors: yes
+
+    - name: Allow Garage S3 API from WireGuard network
+      ufw:
+        rule: allow
+        port: "{{ garage_s3_api_port }}"
+        proto: tcp
+        from_ip: "{{ wireguard_network }}"
+      when: garage_enabled | default(true) | bool
+      ignore_errors: yes
+
+    - name: Allow Garage S3 API from private Docker networks
+      ufw:
+        rule: allow
+        port: "{{ garage_s3_api_port }}"
+        proto: tcp
+        from_ip: "{{ nextcloud_docker_network_cidr }}"
+      when: garage_enabled | default(true) | bool
+      ignore_errors: yes
+
+    - name: Allow Garage RPC and admin APIs from WireGuard network
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+        from_ip: "{{ wireguard_network }}"
+      loop:
+        - "{{ garage_rpc_port }}"
+        - "{{ garage_admin_port }}"
+      when: garage_enabled | default(true) | bool
+      ignore_errors: yes
+
+    - name: Allow shared Redis server from WireGuard network
+      ufw:
+        rule: allow
+        port: "{{ redis_server_port }}"
+        proto: tcp
+        from_ip: "{{ wireguard_network }}"
+      ignore_errors: yes
+
+    - name: Allow shared Redis proxy from WireGuard network
+      ufw:
+        rule: allow
+        port: "{{ nextcloud_redis_port }}"
+        proto: tcp
+        from_ip: "{{ wireguard_network }}"
+      ignore_errors: yes
+
+    - name: Allow shared Redis proxy from private Docker networks
+      ufw:
+        rule: allow
+        port: "{{ nextcloud_redis_port }}"
+        proto: tcp
+        from_ip: "{{ nextcloud_docker_network_cidr }}"
+      ignore_errors: yes
+
+    - name: Allow Redis Sentinel from WireGuard network
+      ufw:
+        rule: allow
+        port: "{{ redis_sentinel_port }}"
+        proto: tcp
+        from_ip: "{{ wireguard_network }}"
+      ignore_errors: yes
+
+    - name: Allow etcd client port from WireGuard network
+      ufw:
+        rule: allow
+        port: "{{ etcd_port_client }}"
+        proto: tcp
+        from_ip: "{{ wireguard_network }}"
+      ignore_errors: yes
+
+    - name: Allow etcd peer port from WireGuard network
+      ufw:
+        rule: allow
+        port: "{{ etcd_port_peer }}"
+        proto: tcp
+        from_ip: "{{ wireguard_network }}"
+      ignore_errors: yes
+
+    - name: Allow NFSv4 for shared ACME challenges
+      ufw:
+        rule: allow
+        port: "2049"
+        proto: tcp
+        from_ip: "{{ wireguard_network }}"
+      ignore_errors: yes
+
+    - name: Allow monitoring ports from WireGuard network
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+        from_ip: "{{ wireguard_network }}"
+      loop:
+        - "{{ prometheus_port }}"
+        - "{{ node_exporter_port }}"
+      ignore_errors: yes
+
+    - name: Enable UFW
+      ufw:
+        state: enabled

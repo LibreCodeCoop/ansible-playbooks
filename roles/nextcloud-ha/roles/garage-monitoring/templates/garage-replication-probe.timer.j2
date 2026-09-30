@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Garage S3 replication visibility probe
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec={{ garage_monitoring_probe_interval_seconds }}s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

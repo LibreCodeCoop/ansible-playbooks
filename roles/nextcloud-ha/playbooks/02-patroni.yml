@@ -1,0 +1,383 @@
+---
+- name: Deploy Patroni PostgreSQL cluster and database VIP
+  hosts: nextcloud_cluster
+  gather_facts: true
+  become: true
+
+  vars_files:
+    - ../group_vars/all.yml
+
+  vars:
+    onlyoffice_db_password_effective: "{{ lookup('ansible.builtin.password', playbook_dir ~ '/../.onlyoffice_secrets/onlyoffice_db_password length=32 chars=ascii_letters,digits') }}"
+    monitoring_postgres_exporter_password: "{{ lookup('ansible.builtin.password', playbook_dir ~ '/../.generated-secrets/monitoring-postgres.pass length=32 chars=ascii_letters,digits') }}"
+
+  tasks:
+    - name: Install PostgreSQL repository prerequisites
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+        state: present
+        update_cache: true
+
+    - name: Install PostgreSQL repository signing key
+      ansible.builtin.get_url:
+        url: https://www.postgresql.org/media/keys/ACCC4CF8.asc
+        dest: /usr/share/keyrings/postgresql.asc
+        mode: '0644'
+
+    - name: Configure PostgreSQL repository
+      ansible.builtin.apt_repository:
+        repo: >-
+          deb [signed-by=/usr/share/keyrings/postgresql.asc]
+          https://apt.postgresql.org/pub/repos/apt
+          {{ ansible_distribution_release }}-pgdg main
+        filename: pgdg
+        state: present
+
+    - name: Install PostgreSQL and Patroni
+      ansible.builtin.apt:
+        name:
+          - "postgresql-{{ postgres_version }}"
+          - "postgresql-client-{{ postgres_version }}"
+          - patroni
+          - python3-psycopg2
+          - python3-etcd
+          - jq
+        state: present
+        update_cache: true
+
+    - name: Ensure shared Ansible remote tmp exists for privilege escalation
+      ansible.builtin.file:
+        path: /tmp/ansible-remote
+        state: directory
+        owner: ansible-lc
+        group: ansible-lc
+        mode: '1777'
+
+    - name: Disable package-created PostgreSQL cluster
+      ansible.builtin.lineinfile:
+        path: "/etc/postgresql/{{ postgres_version }}/main/start.conf"
+        regexp: '^(auto|manual|disabled)$'
+        line: manual
+        create: false
+      failed_when: false
+
+    - name: Disable package-created PostgreSQL cluster service
+      ansible.builtin.systemd:
+        name: "postgresql@{{ postgres_version }}-main"
+        enabled: false
+        state: stopped
+      failed_when: false
+
+    - name: Create Patroni directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: '0750'
+      loop:
+        - /etc/patroni
+        - "/var/lib/postgresql/{{ postgres_version }}/patroni"
+
+    - name: Read WireGuard public key for VIP route reconciliation
+      ansible.builtin.slurp:
+        src: /etc/wireguard/publickey
+      register: wg_public_key_raw
+      no_log: true
+
+    - name: Set WireGuard public key fact
+      ansible.builtin.set_fact:
+        wg_public_key_value: "{{ wg_public_key_raw.content | b64decode | trim }}"
+      no_log: true
+
+    - name: Deploy Patroni configuration
+      ansible.builtin.template:
+        src: ../roles/patroni/templates/patroni-with-vip.yml.j2
+        dest: /etc/patroni/patroni.yml
+        owner: postgres
+        group: postgres
+        mode: '0600'
+      notify: Restart Patroni
+
+    - name: Deploy Patroni systemd service
+      ansible.builtin.template:
+        src: ../roles/patroni/templates/patroni-with-vip.service.j2
+        dest: /etc/systemd/system/patroni.service
+        mode: '0644'
+      notify: Restart Patroni
+
+    - name: Deploy WireGuard-compatible VIP manager
+      ansible.builtin.template:
+        src: ../roles/patroni/templates/patroni-vip-manager.sh.j2
+        dest: /usr/local/sbin/patroni-vip-manager
+        owner: root
+        group: root
+        mode: '0755'
+      notify: Restart vip-manager
+
+    - name: Deploy vip-manager systemd service
+      ansible.builtin.template:
+        src: ../roles/patroni/templates/vip-manager.service.j2
+        dest: /etc/systemd/system/vip-manager.service
+        mode: '0644'
+      notify: Restart vip-manager
+
+    - name: Enable and start Patroni
+      ansible.builtin.systemd:
+        name: patroni
+        daemon_reload: true
+        enabled: true
+        state: started
+
+    - name: Flush Patroni handlers
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for local Patroni API
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ patroni_api_port }}/patroni"
+        status_code: 200
+      register: patroni_api
+      retries: 30
+      delay: 2
+      until: patroni_api.status == 200
+
+    - name: Enable and start vip-manager
+      ansible.builtin.systemd:
+        name: vip-manager
+        daemon_reload: true
+        enabled: true
+        state: started
+
+    - name: Detect Patroni leader
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ patroni_api_port }}/leader"
+        status_code:
+          - 200
+          - 503
+      register: patroni_leader
+
+    - name: Check Nextcloud database role on leader
+      ansible.builtin.command:
+        argv:
+          - psql
+          - -tAc
+          - "SELECT 1 FROM pg_roles WHERE rolname='{{ nextcloud_db_user }}'"
+      become_user: postgres
+      register: nextcloud_role_exists
+      changed_when: false
+      when: patroni_leader.status == 200
+
+    - name: Create Nextcloud database role on leader
+      ansible.builtin.command:
+        argv:
+          - psql
+          - -c
+          - >-
+            CREATE ROLE {{ nextcloud_db_user }} LOGIN CREATEDB
+            PASSWORD '{{ nextcloud_db_password }}'
+      become_user: postgres
+      no_log: true
+      when:
+        - patroni_leader.status == 200
+        - nextcloud_role_exists.stdout | trim != '1'
+
+    - name: Check Nextcloud database on leader
+      ansible.builtin.command:
+        argv:
+          - psql
+          - -tAc
+          - "SELECT 1 FROM pg_database WHERE datname='{{ nextcloud_db_name }}'"
+      become_user: postgres
+      register: nextcloud_database_exists
+      changed_when: false
+      when: patroni_leader.status == 200
+
+    - name: Create Nextcloud database on leader
+      ansible.builtin.command:
+        argv:
+          - createdb
+          - --owner
+          - "{{ nextcloud_db_user }}"
+          - "{{ nextcloud_db_name }}"
+      become_user: postgres
+      when:
+        - patroni_leader.status == 200
+        - nextcloud_database_exists.stdout | trim != '1'
+
+    - name: Check OnlyOffice database role on leader
+      ansible.builtin.command:
+        argv:
+          - psql
+          - -tAc
+          - "SELECT 1 FROM pg_roles WHERE rolname='{{ onlyoffice_db_user }}'"
+      become_user: postgres
+      register: onlyoffice_role_exists
+      changed_when: false
+      when:
+        - patroni_leader.status == 200
+        - nextcloud_onlyoffice_enabled | bool
+
+    - name: Create OnlyOffice database role on leader
+      ansible.builtin.command:
+        argv:
+          - psql
+          - -c
+          - >-
+            CREATE ROLE {{ onlyoffice_db_user }} LOGIN
+            PASSWORD '{{ onlyoffice_db_password_effective }}'
+      become_user: postgres
+      no_log: true
+      when:
+        - patroni_leader.status == 200
+        - nextcloud_onlyoffice_enabled | bool
+        - onlyoffice_role_exists.stdout | trim != '1'
+
+    - name: Check OnlyOffice database on leader
+      ansible.builtin.command:
+        argv:
+          - psql
+          - -tAc
+          - "SELECT 1 FROM pg_database WHERE datname='{{ onlyoffice_db_name }}'"
+      become_user: postgres
+      register: onlyoffice_database_exists
+      changed_when: false
+      when:
+        - patroni_leader.status == 200
+        - nextcloud_onlyoffice_enabled | bool
+
+    - name: Create OnlyOffice database on leader
+      ansible.builtin.command:
+        argv:
+          - createdb
+          - --owner
+          - "{{ onlyoffice_db_user }}"
+          - "{{ onlyoffice_db_name }}"
+      become_user: postgres
+      when:
+        - patroni_leader.status == 200
+        - nextcloud_onlyoffice_enabled | bool
+        - onlyoffice_database_exists.stdout | trim != '1'
+
+    - name: Check OnlyOffice database owner on leader
+      ansible.builtin.command:
+        argv:
+          - psql
+          - -tAc
+          - "SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname='{{ onlyoffice_db_name }}'"
+      become_user: postgres
+      register: onlyoffice_database_owner
+      changed_when: false
+      when:
+        - patroni_leader.status == 200
+        - nextcloud_onlyoffice_enabled | bool
+
+    - name: Ensure OnlyOffice database owner on leader
+      ansible.builtin.command:
+        argv:
+          - psql
+          - -c
+          - "ALTER DATABASE {{ onlyoffice_db_name }} OWNER TO {{ onlyoffice_db_user }}"
+      become_user: postgres
+      when:
+        - patroni_leader.status == 200
+        - nextcloud_onlyoffice_enabled | bool
+        - onlyoffice_database_owner.stdout | trim != onlyoffice_db_user
+
+    - name: Check PostgreSQL exporter role on leader
+      ansible.builtin.command:
+        argv:
+          - psql
+          - -tAc
+          - "SELECT 1 FROM pg_roles WHERE rolname='{{ monitoring_postgres_user }}'"
+      become_user: postgres
+      register: monitoring_postgres_role_exists
+      changed_when: false
+      when: patroni_leader.status == 200
+
+    - name: Create PostgreSQL exporter role on leader
+      ansible.builtin.command:
+        argv:
+          - psql
+          - -c
+          - >-
+            CREATE ROLE {{ monitoring_postgres_user }} LOGIN
+            PASSWORD '{{ monitoring_postgres_exporter_password }}'
+      become_user: postgres
+      no_log: true
+      when:
+        - patroni_leader.status == 200
+        - monitoring_postgres_role_exists.stdout | trim != '1'
+
+    - name: Ensure PostgreSQL exporter role password on leader
+      ansible.builtin.command:
+        argv:
+          - psql
+          - -c
+          - >-
+            ALTER ROLE {{ monitoring_postgres_user }}
+            PASSWORD '{{ monitoring_postgres_exporter_password }}'
+      become_user: postgres
+      no_log: true
+      when: patroni_leader.status == 200
+
+    - name: Grant pg_monitor to PostgreSQL exporter on leader
+      ansible.builtin.command:
+        argv:
+          - psql
+          - -c
+          - "GRANT pg_monitor TO {{ monitoring_postgres_user }}"
+      become_user: postgres
+      when: patroni_leader.status == 200
+
+    - name: Check OnlyOffice public schema owner on leader
+      ansible.builtin.command:
+        argv:
+          - psql
+          - -d
+          - "{{ onlyoffice_db_name }}"
+          - -tAc
+          - "SELECT nspowner::regrole::text FROM pg_namespace WHERE nspname='public'"
+      become_user: postgres
+      register: onlyoffice_public_schema_owner
+      changed_when: false
+      when:
+        - patroni_leader.status == 200
+        - nextcloud_onlyoffice_enabled | bool
+
+    - name: Ensure OnlyOffice public schema owner on leader
+      ansible.builtin.command:
+        argv:
+          - psql
+          - -d
+          - "{{ onlyoffice_db_name }}"
+          - -c
+          - "ALTER SCHEMA public OWNER TO {{ onlyoffice_db_user }}"
+      become_user: postgres
+      when:
+        - patroni_leader.status == 200
+        - nextcloud_onlyoffice_enabled | bool
+        - onlyoffice_public_schema_owner.stdout | trim != onlyoffice_db_user
+
+    - name: Wait for database VIP
+      ansible.builtin.wait_for:
+        host: "{{ vip_address }}"
+        port: "{{ postgres_port }}"
+        timeout: 30
+
+  handlers:
+    - name: Restart Patroni
+      ansible.builtin.systemd:
+        name: patroni
+        daemon_reload: true
+        enabled: true
+        state: restarted
+
+    - name: Restart vip-manager
+      ansible.builtin.systemd:
+        name: vip-manager
+        daemon_reload: true
+        enabled: true
+        state: restarted

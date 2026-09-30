@@ -1,0 +1,78 @@
+---
+- name: Validate deployment inputs
+  import_playbook: playbooks/00-preflight.yml
+
+- name: Install Nextcloud Base
+  import_playbook: playbooks/00-nextcloud-install.yml
+  
+- name: Deploy Nextcloud HA Cluster with vip_patroni
+  hosts: nextcloud_cluster
+  gather_facts: true
+  become: true
+  
+  pre_tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+    
+    - name: Install base utilities
+      apt:
+        name:
+          - python3-pip
+          - python3-jwt
+          - jq
+          - curl
+          - wget
+          - arping
+          - ufw
+        state: present
+
+- name: Deploy WireGuard Mesh Network
+  import_playbook: playbooks/01-wireguard.yml
+
+- name: Deploy etcd and shared Redis
+  import_playbook: playbooks/02-datastores.yml
+
+- name: Deploy Patroni PostgreSQL Cluster with VIP
+  import_playbook: playbooks/02-patroni.yml
+
+- name: Deploy Nextcloud Configuration
+  import_playbook: playbooks/03-nextcloud.yml
+
+- name: Deploy OnlyOffice behind the Nextcloud proxy path
+  import_playbook: playbooks/07-onlyoffice.yml
+
+- name: Apply Nextcloud administrative configuration
+  import_playbook: playbooks/06-nextcloud-admin.yml
+
+- name: Apply Firewall Rules
+  import_playbook: playbooks/04-firewall.yml
+
+- name: Deploy Monitoring Agents
+  import_playbook: playbooks/05-monitoring.yml
+
+- name: Deploy Garage Monitoring
+  import_playbook: playbooks/08-garage-monitoring.yml
+
+- name: Post-Deployment Validation
+  hosts: nextcloud_cluster
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Display deployment summary
+      debug:
+        msg: |
+          ========================================
+          Deployment Complete!
+          
+          Next Steps:
+          1. Run ansible-playbook tests.yml
+          2. Configure your DNS:
+             - nextcloud.example.invalid → 203.0.113.10, .11, .12 (3 records A)
+             - db.nextcloud.local → 10.0.0.100 (VIP - gerenciado automaticamente)
+          3. Test failover: ansible-playbook tests.yml --tags failover (homologacao)
+          
+          VIP: {{ vip_address }}/{{ vip_netmask }} on {{ wireguard_interface }}
+          Database endpoint: {{ vip_address }}:{{ postgres_port }}
+          ========================================

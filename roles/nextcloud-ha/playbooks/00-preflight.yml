@@ -1,0 +1,85 @@
+---
+- name: Validate Nextcloud HA deployment inputs
+  hosts: nextcloud_cluster
+  gather_facts: true
+  become: true
+
+  vars_files:
+    - ../group_vars/all.yml
+
+  tasks:
+    - name: Validate cluster topology and addressing
+      ansible.builtin.assert:
+        that:
+          - groups['nextcloud_cluster'] | length >= 2
+          - groups['nextcloud_cluster'] | map('extract', hostvars, 'wg_ip') | list | unique | length == groups['nextcloud_cluster'] | length
+          - garage_replication_factor | int <= groups['nextcloud_cluster'] | length
+          - redis_server_port | int > 0
+          - redis_proxy_port | int > 0
+          - redis_proxy_port | int != redis_server_port | int
+          - nextcloud_domain != 'nextcloud.example.invalid'
+          - ansible_port | int == ssh_service_port | int
+          - postgres_version | string == '17'
+          - >-
+            garage_s3_endpoint_host == wg_ip
+            or garage_s3_endpoint_host not in (
+              groups['nextcloud_cluster'] | map('extract', hostvars, 'wg_ip') | list
+            )
+        fail_msg: Cluster, enderecos ou parametros HA inconsistentes.
+
+    - name: Ensure local OnlyOffice secrets directory exists
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/../.onlyoffice_secrets"
+        state: directory
+        mode: '0700'
+      delegate_to: localhost
+      become: false
+      run_once: true
+      when: nextcloud_onlyoffice_enabled | bool
+
+    - name: Generate cluster-wide OnlyOffice secrets when missing
+      ansible.builtin.set_fact:
+        onlyoffice_db_password: "{{ lookup('ansible.builtin.password', playbook_dir ~ '/../.onlyoffice_secrets/onlyoffice_db_password length=32 chars=ascii_letters,digits') }}"
+        onlyoffice_jwt_secret: "{{ lookup('ansible.builtin.password', playbook_dir ~ '/../.onlyoffice_secrets/onlyoffice_jwt_secret length=48 chars=ascii_letters,digits') }}"
+      delegate_to: localhost
+      delegate_facts: true
+      run_once: true
+      no_log: true
+      when: nextcloud_onlyoffice_enabled | bool
+
+    - name: Validate required secrets
+      ansible.builtin.assert:
+        that:
+          - postgres_replication_password | length >= 32
+          - postgres_superuser_password | length >= 32
+          - nextcloud_db_password | length >= 32
+          - nextcloud_admin_password | length >= 32
+          - redis_password | length >= 32
+          - garage_rpc_secret | length == 64
+          - garage_admin_token | length >= 32
+          - garage_metrics_token | length >= 32
+          - garage_s3_key_id | length > 20
+          - garage_s3_secret | length == 64
+        fail_msg: Os segredos obrigatorios do Vault estao ausentes ou invalidos.
+      no_log: true
+      when: nextcloud_onlyoffice_enabled | bool
+
+    - name: Ensure WireGuard network does not overlap an existing route
+      ansible.builtin.command: ip -4 route show
+      register: existing_routes
+      changed_when: false
+
+    - name: Validate WireGuard route availability
+      ansible.builtin.assert:
+        that:
+          - >-
+            (wireguard_network not in existing_routes.stdout)
+            or ((wireguard_network ~ ' dev ' ~ wireguard_interface) in existing_routes.stdout)
+        fail_msg: "A rede WireGuard {{ wireguard_network }} ja existe neste host."
+
+    - name: Warn about temporary two-node quorum
+      ansible.builtin.debug:
+        msg: >-
+          Cluster temporario com dois membros: a perda de qualquer membro
+          interrompe o quorum do etcd ate sua recuperacao.
+      when: groups['nextcloud_cluster'] | length == 2

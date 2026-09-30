@@ -1,0 +1,43 @@
+services:
+  garage:
+    image: "{{ garage_docker_image }}"
+
+  db:
+    profiles:
+      - local-only
+
+  redis:
+    profiles:
+      - local-only
+
+  app:
+    depends_on: !reset []
+    environment:
+      NEXTCLOUD_TRUSTED_DOMAINS: "{{ nextcloud_trusted_domains }}"
+      POSTGRES_HOST: "{{ nextcloud_postgres_host }}"
+      POSTGRES_PORT: "{{ nextcloud_postgres_port }}"
+      REDIS_HOST: "{{ nextcloud_redis_host }}"
+      REDIS_HOST_PORT: "{{ nextcloud_redis_port }}"
+      REDIS_HOST_PASSWORD: "{{ redis_password }}"
+      GARAGES3_HOSTNAME: "{{ garage_s3_endpoint_host }}"
+      GARAGES3_KEY: "{{ garage_s3_key_id }}"
+      GARAGES3_KEY_ID: "{{ garage_s3_key_id }}"
+      GARAGES3_PORT: "{{ garage_s3_api_port }}"
+      GARAGES3_REGION: "{{ garage_s3_region }}"
+      GARAGES3_USE_SSL: "{{ garage_s3_use_ssl | bool | ternary('1', '0') }}"
+      GARAGES3_USE_PATH_STYLE: "1"
+
+  cron:
+    depends_on: !reset []
+    environment:
+      NEXTCLOUD_TRUSTED_DOMAINS: "{{ nextcloud_trusted_domains }}"
+      REDIS_HOST: "{{ nextcloud_redis_host }}"
+      REDIS_HOST_PORT: "{{ nextcloud_redis_port }}"
+      REDIS_HOST_PASSWORD: "{{ redis_password }}"
+      GARAGES3_HOSTNAME: "{{ garage_s3_endpoint_host }}"
+      GARAGES3_KEY: "{{ garage_s3_key_id }}"
+      GARAGES3_KEY_ID: "{{ garage_s3_key_id }}"
+      GARAGES3_PORT: "{{ garage_s3_api_port }}"
+      GARAGES3_REGION: "{{ garage_s3_region }}"
+      GARAGES3_USE_SSL: "{{ garage_s3_use_ssl | bool | ternary('1', '0') }}"
+      GARAGES3_USE_PATH_STYLE: "1"

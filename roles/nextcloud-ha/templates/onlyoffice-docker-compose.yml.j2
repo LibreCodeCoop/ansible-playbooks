@@ -1,0 +1,43 @@
+networks:
+  postgres:
+    external: true
+    name: postgres
+  reverse-proxy:
+    external: true
+    name: reverse-proxy
+  onlyoffice:
+    external: true
+    name: onlyoffice
+  nextcloud_internal:
+    external: true
+    name: "{{ nextcloud_internal_network_name }}"
+
+services:
+  onlyoffice:
+    image: "{{ onlyoffice_docker_image }}"
+    stdin_open: true
+    tty: true
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./volumes/onlyoffice/DocumentServer/logs:/var/log/onlyoffice
+      - ./volumes/onlyoffice/DocumentServer/data:/var/www/onlyoffice/Data
+      - ./volumes/onlyoffice/DocumentServer/cache:/var/www/onlyoffice/documentserver/.cache
+      - ./volumes/onlyoffice/DocumentServer/lib:/var/lib/onlyoffice
+      - ./volumes/onlyoffice/DocumentServer/rabbitmq:/var/lib/rabbitmq
+      - ./volumes/onlyoffice/DocumentServer/redis:/var/lib/redis
+      - ./volumes/onlyoffice/DocumentServer/my_fonts_folder:/usr/share/fonts/truetype/custom
+    networks:
+      - postgres
+      - reverse-proxy
+      - onlyoffice
+      - nextcloud_internal
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 1.5GB
+        reservations:
+          cpus: '2'
+          memory: 1.2GB

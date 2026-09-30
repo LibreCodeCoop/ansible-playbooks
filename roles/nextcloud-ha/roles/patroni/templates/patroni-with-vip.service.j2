@@ -1,0 +1,28 @@
+[Unit]
+Description=Patroni PostgreSQL HA with VIP Management
+After=network.target etcd.service postgresql.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=postgres
+Group=postgres
+ExecStart=/usr/bin/patroni /etc/patroni/patroni.yml
+Restart=always
+RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=30
+
+# Environment
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONUNBUFFERED=1
+Environment=PATRONI_LOG_LEVEL=INFO
+
+# Security hardening (adjust as needed)
+NoNewPrivileges=false
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,81 @@
+---
+- name: Deploy OnlyOffice Document Server
+  hosts: nextcloud_cluster
+  gather_facts: true
+  become: true
+  any_errors_fatal: true
+
+  vars_files:
+    - ../group_vars/all.yml
+
+  vars:
+    onlyoffice_db_password_effective: "{{ lookup('ansible.builtin.password', playbook_dir ~ '/../.onlyoffice_secrets/onlyoffice_db_password length=32 chars=ascii_letters,digits') }}"
+    onlyoffice_jwt_secret_effective: "{{ lookup('ansible.builtin.password', playbook_dir ~ '/../.onlyoffice_secrets/onlyoffice_jwt_secret length=48 chars=ascii_letters,digits') }}"
+
+  pre_tasks:
+    - name: Ensure local OnlyOffice secrets directory exists
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/../.onlyoffice_secrets"
+        state: directory
+        mode: '0700'
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Skip OnlyOffice deployment when disabled
+      ansible.builtin.meta: end_host
+      when: not nextcloud_onlyoffice_enabled | bool
+
+  tasks:
+    - name: Ensure the OnlyOffice project directory exists
+      ansible.builtin.file:
+        path: "{{ onlyoffice_project_path }}"
+        state: directory
+        mode: '0755'
+
+    - name: Ensure the OnlyOffice DocumentServer cache directory exists
+      ansible.builtin.file:
+        path: "{{ onlyoffice_project_path }}/volumes/onlyoffice/DocumentServer/cache"
+        state: directory
+        owner: 105
+        group: 107
+        mode: '0775'
+
+    - name: Ensure docker networks exist for OnlyOffice
+      community.docker.docker_network:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - postgres
+        - reverse-proxy
+        - onlyoffice
+
+    - name: Template OnlyOffice docker-compose
+      ansible.builtin.template:
+        src: ../templates/onlyoffice-docker-compose.yml.j2
+        dest: "{{ onlyoffice_project_path }}/docker-compose.yml"
+      tags:
+        - onlyoffice_config
+        - onlyoffice_update
+
+    - name: Copy OnlyOffice .env file
+      ansible.builtin.template:
+        src: ../templates/onlyoffice.env.j2
+        dest: "{{ onlyoffice_project_path }}/.env"
+      tags:
+        - onlyoffice_config
+
+    - name: Start OnlyOffice services
+      community.docker.docker_compose_v2:
+        project_src: "{{ onlyoffice_project_path }}"
+        state: present
+        pull: always
+        recreate: always
+        remove_orphans: true
+      tags:
+        - onlyoffice_update
+
+    - name: Ensure OnlyOffice services are running
+      community.docker.docker_compose_v2:
+        project_src: "{{ onlyoffice_project_path }}"
+        state: present

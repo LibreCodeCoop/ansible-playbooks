@@ -1,0 +1,7 @@
+---
+- name: Deploy Garage monitoring
+  hosts: nextcloud_cluster
+  become: true
+  gather_facts: true
+  roles:
+    - garage-monitoring

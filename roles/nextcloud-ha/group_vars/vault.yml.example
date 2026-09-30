@@ -1,0 +1,13 @@
+---
+# Copie para group_vars/vault.yml e proteja com:
+# ansible-vault encrypt group_vars/vault.yml
+vault_garage_rpc_secret: "gere-64-caracteres-hexadecimais-compartilhados"
+vault_garage_admin_token: "gere-um-token-admin"
+vault_garage_metrics_token: "gere-um-token-de-metricas"
+vault_postgres_replication_password: "substitua"
+vault_postgres_superuser_password: "substitua"
+vault_nextcloud_db_password: "substitua"
+vault_nextcloud_admin_password: "substitua"
+vault_nextcloud_admin_email: "admin@example.com"
+vault_garage_s3_key_id: "GK..."
+vault_garage_s3_secret: "..."

@@ -1,0 +1,21 @@
+[Unit]
+Description=Redis TCP proxy for Nextcloud HA
+After=network-online.target redis-sentinel.service
+Requires=redis-sentinel.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/bin/socat TCP-LISTEN:{{ redis_proxy_port }},bind={{ wg_ip }},reuseaddr,fork EXEC:/usr/local/sbin/redis-proxy-connect
+Restart=always
+RestartSec=2
+TimeoutStopSec=10
+NoNewPrivileges=false
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

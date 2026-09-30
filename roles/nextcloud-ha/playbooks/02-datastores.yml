@@ -1,0 +1,240 @@
+---
+- name: Deploy etcd quorum and shared Redis
+  hosts: nextcloud_cluster
+  gather_facts: true
+  become: true
+
+  tasks:
+    - name: Install etcd server and Redis client
+      ansible.builtin.apt:
+        name:
+          - etcd-server
+          - etcd-client
+          - redis-tools
+        state: present
+        update_cache: true
+
+    - name: Configure etcd member
+      ansible.builtin.copy:
+        dest: /etc/default/etcd
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          ETCD_NAME="{{ patroni_name }}"
+          ETCD_DATA_DIR="/var/lib/etcd/nextcloud"
+          ETCD_LISTEN_PEER_URLS="http://{{ wg_ip }}:{{ etcd_port_peer }}"
+          ETCD_INITIAL_ADVERTISE_PEER_URLS="http://{{ wg_ip }}:{{ etcd_port_peer }}"
+          ETCD_LISTEN_CLIENT_URLS="http://127.0.0.1:{{ etcd_port_client }},http://{{ wg_ip }}:{{ etcd_port_client }}"
+          ETCD_ADVERTISE_CLIENT_URLS="http://{{ wg_ip }}:{{ etcd_port_client }}"
+          ETCD_INITIAL_CLUSTER="{% for host in groups['nextcloud_cluster'] %}{{ hostvars[host].patroni_name }}=http://{{ hostvars[host].wg_ip }}:{{ etcd_port_peer }}{% if not loop.last %},{% endif %}{% endfor %}"
+          ETCD_INITIAL_CLUSTER_TOKEN="{{ etcd_cluster_token }}"
+          ETCD_INITIAL_CLUSTER_STATE="new"
+      notify: Restart etcd
+
+    - name: Ensure etcd waits for WireGuard
+      ansible.builtin.file:
+        path: /etc/systemd/system/etcd.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Configure etcd systemd WireGuard dependency
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/etcd.service.d/wireguard.conf
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          After=network-online.target wg-quick@{{ wireguard_interface }}.service
+          Wants=network-online.target
+          Requires=wg-quick@{{ wireguard_interface }}.service
+      notify: Restart etcd
+
+    - name: Enable and start etcd
+      ansible.builtin.systemd:
+        name: etcd
+        daemon_reload: true
+        enabled: true
+        state: started
+
+    - name: Flush etcd configuration
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for local etcd endpoint
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ etcd_port_client }}/health"
+        return_content: true
+      register: etcd_health
+      retries: 20
+      delay: 2
+      until: etcd_health.status == 200
+
+    - name: Validate etcd cluster membership
+      ansible.builtin.command:
+        argv:
+          - etcdctl
+          - "--endpoints=http://{{ wg_ip }}:{{ etcd_port_client }}"
+          - member
+          - list
+      environment:
+        ETCDCTL_API: '3'
+      register: etcd_members
+      changed_when: false
+      retries: 10
+      delay: 2
+      until: etcd_members.stdout_lines | length == groups['nextcloud_cluster'] | length
+
+    - name: Install shared Redis HA packages
+      ansible.builtin.apt:
+        name:
+          - redis-server
+          - redis-tools
+          - socat
+        state: present
+        update_cache: true
+
+    - name: Deploy Redis server configuration
+      ansible.builtin.template:
+        src: ../templates/redis.conf.j2
+        dest: /etc/redis/redis.conf
+        owner: redis
+        group: redis
+        mode: '0640'
+      no_log: true
+      notify: Restart Redis
+
+    - name: Deploy Redis Sentinel configuration
+      ansible.builtin.template:
+        src: ../templates/redis-sentinel.conf.j2
+        dest: /etc/redis/sentinel.conf
+        owner: redis
+        group: redis
+        mode: '0640'
+      no_log: true
+      notify: Restart Redis Sentinel
+
+    - name: Deploy Redis proxy connection helper
+      ansible.builtin.template:
+        src: ../templates/redis-proxy-connect.sh.j2
+        dest: /usr/local/sbin/redis-proxy-connect
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Deploy Redis proxy systemd service
+      ansible.builtin.template:
+        src: ../templates/redis-proxy.service.j2
+        dest: /etc/systemd/system/redis-proxy.service
+        mode: '0644'
+      notify: Restart Redis proxy
+
+    - name: Deploy Redis Sentinel systemd service
+      ansible.builtin.template:
+        src: ../templates/redis-sentinel.service.j2
+        dest: /etc/systemd/system/redis-sentinel.service
+        mode: '0644'
+      notify: Restart Redis Sentinel
+
+    - name: Flush Redis configuration
+      ansible.builtin.meta: flush_handlers
+
+    - name: Enable and start Redis server
+      ansible.builtin.systemd:
+        name: redis-server
+        daemon_reload: true
+        enabled: true
+        state: started
+
+    - name: Enable and start Redis Sentinel
+      ansible.builtin.systemd:
+        name: redis-sentinel
+        daemon_reload: true
+        enabled: true
+        state: started
+
+    - name: Enable and start Redis proxy
+      ansible.builtin.systemd:
+        name: redis-proxy
+        daemon_reload: true
+        enabled: true
+        state: started
+
+    - name: Read Redis master from Sentinel
+      ansible.builtin.command:
+        argv:
+          - redis-cli
+          - -h
+          - 127.0.0.1
+          - -p
+          - "{{ redis_sentinel_port | string }}"
+          - sentinel
+          - get-master-addr-by-name
+          - "{{ redis_sentinel_master_name }}"
+      register: redis_sentinel_master
+      changed_when: false
+      retries: 20
+      delay: 2
+      until: redis_sentinel_master.stdout_lines | length >= 1
+
+    - name: Align Redis role with the Sentinel master
+      ansible.builtin.shell: |
+        set -eu
+        master_ip="$(redis-cli -h 127.0.0.1 -p {{ redis_sentinel_port }} sentinel get-master-addr-by-name {{ redis_sentinel_master_name }} | sed -n '1p')"
+        if [ "$master_ip" = "{{ wg_ip }}" ]; then
+          redis-cli -h 127.0.0.1 -p {{ redis_server_port }} -a "{{ redis_password }}" replicaof no one
+        else
+          redis-cli -h 127.0.0.1 -p {{ redis_server_port }} -a "{{ redis_password }}" replicaof "$master_ip" {{ redis_server_port }}
+        fi
+      args:
+        executable: /bin/bash
+      register: redis_role_alignment
+      changed_when: "'OK' in (redis_role_alignment.stdout | default(''))"
+      no_log: true
+
+    - name: Verify shared Redis proxy
+      ansible.builtin.command:
+        argv:
+          - redis-cli
+          - -h
+          - "{{ nextcloud_redis_host }}"
+          - -p
+          - "{{ nextcloud_redis_port | string }}"
+          - -a
+          - "{{ redis_password }}"
+          - ping
+      register: redis_ping
+      changed_when: false
+      failed_when: redis_ping.stdout | trim != 'PONG'
+      no_log: true
+
+  handlers:
+    - name: Restart etcd
+      ansible.builtin.systemd:
+        name: etcd
+        daemon_reload: true
+        enabled: true
+        state: restarted
+
+    - name: Restart Redis
+      ansible.builtin.systemd:
+        name: redis-server
+        daemon_reload: true
+        enabled: true
+        state: restarted
+
+    - name: Restart Redis Sentinel
+      ansible.builtin.systemd:
+        name: redis-sentinel
+        daemon_reload: true
+        enabled: true
+        state: restarted
+
+    - name: Restart Redis proxy
+      ansible.builtin.systemd:
+        name: redis-proxy
+        daemon_reload: true
+        enabled: true
+        state: restarted

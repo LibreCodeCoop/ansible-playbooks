@@ -1,0 +1,90 @@
+#!/bin/sh
+set -eu
+
+ENV_FILE="{{ garage_monitoring_config_dir }}/probe.env"
+. "$ENV_FILE"
+
+METRICS_FILE="$GARAGE_MONITORING_METRICS_FILE"
+TMP_METRICS="${METRICS_FILE}.tmp.$$"
+LOCK_FILE="${METRICS_FILE}.lock"
+TMP_OBJECT="$(mktemp)"
+AWS_ERROR_FILE="${TMP_OBJECT}.err"
+START_MS="$(date +%s%3N)"
+KEY="${GARAGE_MONITORING_PREFIX}/${GARAGE_MONITORING_NODE}/probe-${START_MS}.bin"
+
+cleanup() {
+  rm -f "$TMP_OBJECT" "$AWS_ERROR_FILE" "$TMP_METRICS"
+  aws s3api delete-object --endpoint-url "$GARAGE_MONITORING_LOCAL_ENDPOINT" \
+    --bucket "$GARAGE_MONITORING_BUCKET" --key "$KEY" >/dev/null 2>&1 || true
+  aws s3api delete-object --endpoint-url "$GARAGE_MONITORING_PEER_ENDPOINT" \
+    --bucket "$GARAGE_MONITORING_BUCKET" --key "$KEY" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+if ! mkdir "$LOCK_FILE" 2>/dev/null; then
+  exit 0
+fi
+trap 'rmdir "$LOCK_FILE" 2>/dev/null || true; cleanup' EXIT
+
+head -c "$GARAGE_MONITORING_SIZE_BYTES" /dev/zero > "$TMP_OBJECT"
+UPLOAD_START_MS="$(date +%s%3N)"
+UPLOAD_OK=0
+UPLOAD_RC=0
+for attempt in 1 2 3; do
+  if aws s3api put-object --endpoint-url "$GARAGE_MONITORING_LOCAL_ENDPOINT" \
+    --bucket "$GARAGE_MONITORING_BUCKET" --key "$KEY" --body "$TMP_OBJECT" >/dev/null 2>"$AWS_ERROR_FILE"; then
+    UPLOAD_OK=1
+    break
+  else
+    UPLOAD_RC=$?
+  fi
+  sleep 1
+done
+if [ "$UPLOAD_OK" -eq 1 ]; then
+  UPLOAD_END_MS="$(date +%s%3N)"
+else
+  ERROR_TEXT="$(tr '\n' ' ' < "$AWS_ERROR_FILE" | cut -c1-400)"
+  logger -t garage-replication-probe "local S3 upload failed rc=${UPLOAD_RC} node=${GARAGE_MONITORING_NODE}: ${ERROR_TEXT}"
+  printf '# HELP garage_replication_probe_success Whether the Garage probe succeeded.\n# TYPE garage_replication_probe_success gauge\ngarage_replication_probe_success{node="%s"} 0\n' "$GARAGE_MONITORING_NODE" > "$TMP_METRICS"
+  chown prometheus:prometheus "$TMP_METRICS"
+  chmod 0644 "$TMP_METRICS"
+  mv "$TMP_METRICS" "$METRICS_FILE"
+  exit 0
+fi
+
+DEADLINE=$((UPLOAD_END_MS / 1000 + GARAGE_MONITORING_TIMEOUT_SECONDS))
+VISIBLE=0
+while [ "$(date +%s)" -le "$DEADLINE" ]; do
+  if aws s3api head-object --endpoint-url "$GARAGE_MONITORING_PEER_ENDPOINT" \
+    --bucket "$GARAGE_MONITORING_BUCKET" --key "$KEY" >/dev/null 2>&1; then
+    VISIBLE=1
+    VISIBILITY_MS="$(date +%s%3N)"
+    break
+  fi
+  sleep 0.2
+done
+
+if [ "$VISIBLE" -eq 1 ]; then
+  LATENCY_MS=$((VISIBILITY_MS - UPLOAD_END_MS))
+  LATENCY_SECONDS="$(awk -v ms="$LATENCY_MS" 'BEGIN { printf "%.6f", ms / 1000 }')"
+else
+  LATENCY_SECONDS=0
+fi
+
+cat > "$TMP_METRICS" <<EOF
+# HELP garage_replication_probe_success Whether the probe object became visible on the peer.
+# TYPE garage_replication_probe_success gauge
+garage_replication_probe_success{node="$GARAGE_MONITORING_NODE",peer_endpoint="$GARAGE_MONITORING_PEER_ENDPOINT"} $VISIBLE
+# HELP garage_replication_probe_latency_seconds Time from successful local S3 upload until peer visibility.
+# TYPE garage_replication_probe_latency_seconds gauge
+garage_replication_probe_latency_seconds{node="$GARAGE_MONITORING_NODE",peer_endpoint="$GARAGE_MONITORING_PEER_ENDPOINT"} $LATENCY_SECONDS
+# HELP garage_replication_probe_upload_size_bytes Size of the synthetic probe object.
+# TYPE garage_replication_probe_upload_size_bytes gauge
+garage_replication_probe_upload_size_bytes{node="$GARAGE_MONITORING_NODE"} $GARAGE_MONITORING_SIZE_BYTES
+# HELP garage_replication_probe_last_run_timestamp_seconds Unix timestamp of the last probe run.
+# TYPE garage_replication_probe_last_run_timestamp_seconds gauge
+garage_replication_probe_last_run_timestamp_seconds{node="$GARAGE_MONITORING_NODE"} $(date +%s)
+EOF
+chown prometheus:prometheus "$TMP_METRICS"
+chmod 0644 "$TMP_METRICS"
+mv "$TMP_METRICS" "$METRICS_FILE"

@@ -1,0 +1,699 @@
+---
+- name: Validar inventario do cluster Nextcloud HA
+  hosts: localhost
+  gather_facts: false
+  vars:
+    test_cluster_group: nextcloud_cluster
+
+  tasks:
+    - name: Validar topologia e variaveis por host
+      ansible.builtin.assert:
+        that:
+          - groups[test_cluster_group] is defined
+          - groups[test_cluster_group] | length == 3
+          - groups[test_cluster_group] | map('extract', hostvars, 'wg_ip') | list | unique | length == 3
+          - groups[test_cluster_group] | map('extract', hostvars, 'patroni_name') | list | unique | length == 3
+        fail_msg: O inventario deve conter tres membros com wg_ip e patroni_name unicos.
+      tags: [always, inventory]
+
+- name: Testar os componentes do cluster Nextcloud HA
+  hosts: nextcloud_cluster
+  gather_facts: false
+  become: true
+  vars:
+    test_handshake_max_age: 300
+    test_compose_override_file: docker-compose-garages3.override.yml
+    test_required_containers:
+      - app
+      - web
+      - cron
+      - garage
+    test_etcd_endpoints: >-
+      {%- for host in groups['nextcloud_cluster'] -%}
+      http://{{ hostvars[host].wg_ip }}:{{ etcd_port_client }}{{ ',' if not loop.last else '' }}
+      {%- endfor -%}
+
+  tasks:
+    - name: Coletar estado dos servicos
+      ansible.builtin.service_facts:
+      tags: [services]
+
+    - name: Validar servicos essenciais
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.services[item + '.service'] is defined
+          - ansible_facts.services[item + '.service'].state == 'running'
+        fail_msg: "O servico {{ item }} nao esta em execucao em {{ inventory_hostname }}."
+      loop:
+        - etcd
+        - patroni
+        - vip-manager
+      tags: [services]
+
+    - name: Consultar handshakes do WireGuard
+      ansible.builtin.command:
+        argv: [wg, show, "{{ wireguard_interface }}", latest-handshakes]
+      register: test_wireguard_handshakes
+      changed_when: false
+      tags: [wireguard]
+
+    - name: Consultar horario atual do host
+      ansible.builtin.command:
+        argv: [date, +%s]
+      register: test_current_epoch
+      changed_when: false
+      tags: [wireguard]
+
+    - name: Validar peers e handshakes do WireGuard
+      ansible.builtin.assert:
+        that:
+          - test_wireguard_handshakes.stdout_lines | length == (groups['nextcloud_cluster'] | length - 1)
+          - item.split()[1] | int > 0
+          - (test_current_epoch.stdout | int) - (item.split()[1] | int) <= test_handshake_max_age | int
+        fail_msg: "Handshake WireGuard ausente ou antigo em {{ inventory_hostname }}: {{ item }}"
+      loop: "{{ test_wireguard_handshakes.stdout_lines }}"
+      tags: [wireguard]
+
+    - name: Testar conectividade entre os peers WireGuard
+      ansible.builtin.command:
+        argv: [ping, -c, '3', -W, '2', "{{ hostvars[item].wg_ip }}"]
+      loop: "{{ groups['nextcloud_cluster'] }}"
+      register: test_wireguard_ping
+      changed_when: false
+      tags: [wireguard]
+
+    - name: Consultar MTU do WireGuard
+      ansible.builtin.command:
+        argv: [cat, "/sys/class/net/{{ wireguard_interface }}/mtu"]
+      register: test_wireguard_mtu_result
+      changed_when: false
+      tags: [wireguard, garage]
+
+    - name: Validar MTU do WireGuard
+      ansible.builtin.assert:
+        that:
+          - test_wireguard_mtu_result.stdout | int == wireguard_mtu | int
+        fail_msg: "MTU de {{ wireguard_interface }} difere de {{ wireguard_mtu }}."
+      tags: [wireguard, garage]
+
+    - name: Consultar VIP local
+      ansible.builtin.command:
+        argv: [ip, -o, -4, addr, show, dev, "{{ wireguard_interface }}"]
+      register: test_local_addresses
+      changed_when: false
+      tags: [vip, patroni]
+
+    - name: Registrar presenca do VIP no host
+      ansible.builtin.set_fact:
+        test_vip_present: "{{ vip_address in test_local_addresses.stdout }}"
+      tags: [vip, patroni]
+
+    - name: Validar que o VIP esta em exatamente um host
+      ansible.builtin.assert:
+        that:
+          - >-
+            groups['nextcloud_cluster']
+            | map('extract', hostvars, 'test_vip_present')
+            | select('equalto', true)
+            | list
+            | length == 1
+        fail_msg: O VIP deve estar presente em exatamente um membro do cluster.
+      run_once: true
+      tags: [vip, patroni]
+
+    - name: Consultar saude dos endpoints etcd
+      ansible.builtin.command:
+        argv:
+          - etcdctl
+          - "--endpoints={{ test_etcd_endpoints }}"
+          - endpoint
+          - health
+      environment:
+        ETCDCTL_API: '3'
+      register: test_etcd_health
+      changed_when: false
+      run_once: true
+      tags: [etcd]
+
+    - name: Consultar membros do etcd
+      ansible.builtin.command:
+        argv:
+          - etcdctl
+          - "--endpoints={{ test_etcd_endpoints }}"
+          - member
+          - list
+      environment:
+        ETCDCTL_API: '3'
+      register: test_etcd_members
+      changed_when: false
+      run_once: true
+      tags: [etcd]
+
+    - name: Validar quorum e quantidade de membros do etcd
+      ansible.builtin.assert:
+        that:
+          - test_etcd_health.rc == 0
+          - test_etcd_health.stdout_lines | length == groups['nextcloud_cluster'] | length
+          - test_etcd_members.stdout_lines | length == groups['nextcloud_cluster'] | length
+        fail_msg: O etcd nao esta saudavel ou nao contem todos os membros esperados.
+      run_once: true
+      tags: [etcd]
+
+    - name: Consultar API de cluster do Patroni
+      ansible.builtin.uri:
+        url: "http://{{ wg_ip }}:{{ patroni_api_port }}/cluster"
+        return_content: true
+      register: test_patroni_api
+      tags: [patroni, vip, postgres]
+
+    - name: Validar estado do Patroni
+      ansible.builtin.assert:
+        that:
+          - test_patroni_api.json.members | length == groups['nextcloud_cluster'] | length
+          - test_patroni_api.json.members | selectattr('role', 'equalto', 'leader') | list | length == 1
+          - >-
+            test_patroni_api.json.members
+            | selectattr('role', 'in', ['replica', 'sync_standby'])
+            | list
+            | length == (groups['nextcloud_cluster'] | length - 1)
+          - >-
+            test_patroni_api.json.members
+            | rejectattr('state', 'in', ['running', 'streaming'])
+            | list
+            | length == 0
+        fail_msg: O Patroni deve apresentar um lider e membros de replicacao ativos.
+      tags: [patroni, postgres]
+
+    - name: Validar que o VIP acompanha o lider Patroni
+      ansible.builtin.assert:
+        that:
+          - >-
+            (test_patroni_api.json.members
+              | selectattr('role', 'equalto', 'leader')
+              | map(attribute='name')
+              | first)
+            == (groups['nextcloud_cluster']
+              | map('extract', hostvars)
+              | selectattr('test_vip_present', 'equalto', true)
+              | map(attribute='patroni_name')
+              | first)
+        fail_msg: O VIP nao esta no membro lider do Patroni.
+      run_once: true
+      tags: [patroni, vip]
+
+    - name: Testar porta PostgreSQL pelo VIP
+      ansible.builtin.wait_for:
+        host: "{{ vip_address }}"
+        port: "{{ postgres_port }}"
+        connect_timeout: 3
+        timeout: 10
+      tags: [postgres, vip]
+
+    - name: Consultar replicas PostgreSQL em streaming
+      ansible.builtin.command:
+        argv:
+          - psql
+          - -At
+          - -d
+          - postgres
+          - -c
+          - SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming';
+      become_user: postgres
+      register: test_postgres_streaming_replicas
+      changed_when: false
+      tags: [postgres, patroni]
+
+    - name: Registrar quantidade local de replicas PostgreSQL
+      ansible.builtin.set_fact:
+        test_postgres_streaming_replica_count: "{{ test_postgres_streaming_replicas.stdout | int }}"
+      tags: [postgres, patroni]
+
+    - name: Validar replicacao PostgreSQL do lider
+      ansible.builtin.assert:
+        that:
+          - >-
+            groups['nextcloud_cluster']
+            | map('extract', hostvars, 'test_postgres_streaming_replica_count')
+            | map('int')
+            | sum == (groups['nextcloud_cluster'] | length - 1)
+          - >-
+            groups['nextcloud_cluster']
+            | map('extract', hostvars, 'test_postgres_streaming_replica_count')
+            | map('int')
+            | select('greaterthan', 0)
+            | list
+            | length == 1
+        fail_msg: O lider PostgreSQL nao apresenta todas as replicas em streaming.
+      run_once: true
+      tags: [postgres, patroni]
+
+    - name: Testar Redis compartilhado
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ nextcloud_compose_file }}"
+          - -f
+          - "{{ test_compose_override_file }}"
+          - exec
+          - -T
+          - --user
+          - www-data
+          - app
+          - php
+          - -r
+          - >-
+            $redis = new Redis();
+            $redis->connect(getenv('REDIS_HOST'), (int) getenv('REDIS_HOST_PORT'));
+            $redis->auth(getenv('REDIS_HOST_PASSWORD'));
+            echo $redis->ping() ? "PONG\n" : "FAIL\n";
+      args:
+        chdir: "{{ nextcloud_project_path }}"
+      register: test_redis_ping
+      changed_when: false
+      failed_when: test_redis_ping.stdout | trim != 'PONG'
+      no_log: true
+      tags: [redis, nextcloud]
+
+    - name: Testar Redis proxy diretamente
+      ansible.builtin.command:
+        argv:
+          - redis-cli
+          - -h
+          - "{{ nextcloud_redis_host }}"
+          - -p
+          - "{{ nextcloud_redis_port | string }}"
+          - -a
+          - "{{ redis_password }}"
+          - ping
+      register: test_redis_vip_ping
+      changed_when: false
+      failed_when: test_redis_vip_ping.stdout | trim != 'PONG'
+      no_log: true
+      tags: [redis, nextcloud]
+
+    - name: Consultar master atual do Redis Sentinel
+      ansible.builtin.command:
+        argv:
+          - redis-cli
+          - -h
+          - 127.0.0.1
+          - -p
+          - "{{ redis_sentinel_port | string }}"
+          - sentinel
+          - get-master-addr-by-name
+          - "{{ redis_sentinel_master_name }}"
+      register: test_redis_sentinel_master
+      changed_when: false
+      tags: [redis]
+
+    - name: Validar master anunciado pelo Redis Sentinel
+      ansible.builtin.assert:
+        that:
+          - test_redis_sentinel_master.stdout_lines | length >= 1
+          - test_redis_sentinel_master.stdout_lines[0] in (groups['nextcloud_cluster'] | map('extract', hostvars, 'wg_ip') | list)
+        fail_msg: O Redis Sentinel nao esta anunciando um master valido do cluster.
+      tags: [redis]
+
+    - name: Consultar quorum do Redis Sentinel
+      ansible.builtin.command:
+        argv:
+          - redis-cli
+          - -h
+          - 127.0.0.1
+          - -p
+          - "{{ redis_sentinel_port | string }}"
+          - sentinel
+          - ckquorum
+          - "{{ redis_sentinel_master_name }}"
+      register: test_redis_sentinel_quorum
+      changed_when: false
+      tags: [redis]
+
+    - name: Validar quorum do Redis Sentinel
+      ansible.builtin.assert:
+        that:
+          - test_redis_sentinel_quorum.stdout is search('^OK ')
+        fail_msg: >-
+          O Redis Sentinel nao tem quorum em {{ inventory_hostname }}:
+          {{ test_redis_sentinel_quorum.stdout }}
+      tags: [redis]
+
+    - name: Consultar containers ativos
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ nextcloud_compose_file }}"
+          - -f
+          - "{{ test_compose_override_file }}"
+          - ps
+          - --services
+          - --filter
+          - status=running
+      args:
+        chdir: "{{ nextcloud_project_path }}"
+      register: test_running_containers
+      changed_when: false
+      tags: [docker, nextcloud, garage]
+
+    - name: Validar containers obrigatorios
+      ansible.builtin.assert:
+        that:
+          - item in test_running_containers.stdout_lines
+        fail_msg: "O container {{ item }} nao esta ativo em {{ inventory_hostname }}."
+      loop: "{{ test_required_containers }}"
+      tags: [docker, nextcloud, garage]
+
+    - name: Consultar estado do Nextcloud
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ nextcloud_compose_file }}"
+          - -f
+          - "{{ test_compose_override_file }}"
+          - exec
+          - -T
+          - --user
+          - www-data
+          - app
+          - php
+          - occ
+          - status
+          - --output=json
+      args:
+        chdir: "{{ nextcloud_project_path }}"
+      register: test_nextcloud_status
+      changed_when: false
+      tags: [nextcloud]
+
+    - name: Validar estado retornado pelo Nextcloud
+      ansible.builtin.assert:
+        that:
+          - (test_nextcloud_status.stdout | from_json).installed | bool
+          - not ((test_nextcloud_status.stdout | from_json).maintenance | bool)
+          - not ((test_nextcloud_status.stdout | from_json).needsDbUpgrade | bool)
+        fail_msg: O Nextcloud nao esta instalado, esta em manutencao ou requer upgrade.
+      tags: [nextcloud]
+
+    - name: Validar acesso do Nextcloud ao banco
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ nextcloud_compose_file }}"
+          - -f
+          - "{{ test_compose_override_file }}"
+          - exec
+          - -T
+          - --user
+          - www-data
+          - app
+          - php
+          - occ
+          - config:app:get
+          - core
+          - installedat
+      args:
+        chdir: "{{ nextcloud_project_path }}"
+      register: test_nextcloud_database
+      changed_when: false
+      failed_when: test_nextcloud_database.stdout | trim | length == 0
+      tags: [nextcloud, postgres]
+
+    - name: Ler configuracoes HA do Nextcloud
+      ansible.builtin.command:
+        argv: >-
+          {{
+            [
+              'docker', 'compose', '-f', nextcloud_compose_file,
+              '-f', test_compose_override_file, 'exec', '-T',
+              '--user', 'www-data', 'app', 'php', 'occ',
+              'config:system:get'
+            ] + item
+          }}
+      args:
+        chdir: "{{ nextcloud_project_path }}"
+      loop:
+        - [dbhost]
+        - [redis, host]
+        - [memcache.locking]
+        - [memcache.distributed]
+        - [memcache.local]
+        - [maintenance_window_start]
+        - [default_phone_region]
+        - [overwriteprotocol]
+        - [serverid]
+        - [forwarded_for_headers, '0']
+        - [trusted_proxies]
+      register: test_nextcloud_ha_config
+      changed_when: false
+      tags: [nextcloud, postgres, redis]
+
+    - name: Validar configuracoes HA do Nextcloud
+      ansible.builtin.assert:
+        that:
+          - test_nextcloud_ha_config.results[0].stdout | trim == (nextcloud_postgres_host ~ ':' ~ (nextcloud_postgres_port | string))
+          - test_nextcloud_ha_config.results[1].stdout | trim == nextcloud_redis_host
+          - test_nextcloud_ha_config.results[2].stdout | trim == '\\OC\\Memcache\\Redis'
+          - test_nextcloud_ha_config.results[3].stdout | trim == '\\OC\\Memcache\\Redis'
+          - test_nextcloud_ha_config.results[4].stdout | trim == '\\OC\\Memcache\\APCu'
+          - test_nextcloud_ha_config.results[5].stdout | trim == (nextcloud_maintenance_window_start | string)
+          - test_nextcloud_ha_config.results[6].stdout | trim == nextcloud_default_phone_region
+          - test_nextcloud_ha_config.results[7].stdout | trim == nextcloud_overwrite_protocol
+          - test_nextcloud_ha_config.results[8].stdout | trim == (nextcloud_server_id | string)
+          - test_nextcloud_ha_config.results[9].stdout | trim == 'HTTP_X_FORWARDED_FOR'
+          - nextcloud_trusted_proxies | difference(test_nextcloud_ha_config.results[10].stdout_lines) | length == 0
+        fail_msg: O Nextcloud nao esta usando as configuracoes HA e administrativas esperadas.
+      tags: [nextcloud, postgres, redis]
+
+    - name: Validar permissoes dos volumes Nextcloud
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ nextcloud_compose_file }}"
+          - -f
+          - "{{ test_compose_override_file }}"
+          - exec
+          - -T
+          - --user
+          - www-data
+          - app
+          - sh
+          - -c
+          - 'test -w /var/www/html/config && test -w /var/www/html/data'
+      args:
+        chdir: "{{ nextcloud_project_path }}"
+      changed_when: false
+      tags: [nextcloud, permissions]
+
+    - name: Validar leitura do Nextcloud pelo nginx do container web
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ nextcloud_compose_file }}"
+          - -f
+          - "{{ test_compose_override_file }}"
+          - exec
+          - -T
+          - --user
+          - nginx
+          - web
+          - sh
+          - -c
+          - 'test -r /var/www/html/status.php'
+      args:
+        chdir: "{{ nextcloud_project_path }}"
+      changed_when: false
+      tags: [nextcloud, permissions]
+
+    - name: Consultar estado do Garage
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ nextcloud_compose_file }}"
+          - -f
+          - "{{ test_compose_override_file }}"
+          - exec
+          - -T
+          - garage
+          - /garage
+          - status
+      args:
+        chdir: "{{ nextcloud_project_path }}"
+      register: test_garage_status
+      changed_when: false
+      tags: [garage]
+
+    - name: Consultar bucket do Garage
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ nextcloud_compose_file }}"
+          - -f
+          - "{{ test_compose_override_file }}"
+          - exec
+          - -T
+          - garage
+          - /garage
+          - bucket
+          - info
+          - "{{ garage_s3_bucket }}"
+      args:
+        chdir: "{{ nextcloud_project_path }}"
+      changed_when: false
+      tags: [garage]
+
+    - name: Consultar unidades systemd com falha
+      ansible.builtin.shell: |
+        systemctl --failed --no-legend --plain | awk '
+          $1 !~ /^(openipmi\.service|rc-local\.service|redis-vip-manager\.service)$/ { print }
+        '
+      register: test_failed_units
+      changed_when: false
+      failed_when: false
+      tags: [services, recovery]
+
+    - name: Validar ausencia de unidades systemd com falha
+      ansible.builtin.assert:
+        that:
+          - test_failed_units.stdout | trim == ''
+        fail_msg: >-
+          Ha unidades systemd com falha em {{ inventory_hostname }}:
+          {{ test_failed_units.stdout }}
+      tags: [services, recovery]
+
+- name: Testar endpoint publico e certificado TLS
+  hosts: localhost
+  gather_facts: false
+  vars:
+    test_validate_certs: true
+    test_nextcloud_domain: "{{ hostvars[groups['nextcloud_cluster'][0]].nextcloud_domain }}"
+    test_public_targets: "{{ groups['nextcloud_cluster'] | map('extract', hostvars, 'ansible_host') | list }}"
+
+  tasks:
+    - name: Consultar status publico do Nextcloud
+      ansible.builtin.uri:
+        url: "https://{{ test_nextcloud_domain }}/status.php"
+        method: GET
+        return_content: true
+        validate_certs: "{{ test_validate_certs }}"
+        status_code: 200
+      register: test_public_status
+      tags: [never, external]
+
+    - name: Validar resposta publica do Nextcloud
+      ansible.builtin.assert:
+        that:
+          - (test_public_status.content | from_json).installed | bool
+          - not ((test_public_status.content | from_json).maintenance | bool)
+        fail_msg: O endpoint publico do Nextcloud nao esta saudavel.
+      tags: [never, external]
+
+    - name: Resolver registros A publicos do dominio Nextcloud
+      ansible.builtin.shell: >-
+        getent ahostsv4 {{ test_nextcloud_domain | quote }}
+        | awk '{ print $1 }'
+        | sort -u
+      register: test_public_dns_records
+      changed_when: false
+      tags: [never, external]
+
+    - name: Validar que o DNS publico lista todos os IPs do cluster
+      ansible.builtin.assert:
+        that:
+          - test_public_targets | difference(test_public_dns_records.stdout_lines) | length == 0
+        fail_msg: >-
+          O DNS publico de {{ test_nextcloud_domain }} deve conter todos os IPs
+          do cluster: {{ test_public_targets | join(', ') }}.
+          Resolvido agora: {{ test_public_dns_records.stdout_lines | join(', ') }}.
+      tags: [never, external]
+
+    - name: Consultar status publico em cada IP do cluster
+      ansible.builtin.command:
+        argv: >-
+          {{
+            ['curl', '--fail', '--silent', '--show-error']
+            + ([] if test_validate_certs | bool else ['--insecure'])
+            + [
+              '--connect-timeout', '5',
+              '--max-time', '10',
+              '--resolve', test_nextcloud_domain ~ ':443:' ~ item,
+              'https://' ~ test_nextcloud_domain ~ '/status.php'
+            ]
+          }}
+      loop: "{{ test_public_targets }}"
+      register: test_public_status_by_ip
+      changed_when: false
+      tags: [never, external]
+
+    - name: Validar resposta publica por IP do cluster
+      ansible.builtin.assert:
+        that:
+          - (item.stdout | from_json).installed | bool
+          - not ((item.stdout | from_json).maintenance | bool)
+        fail_msg: "O IP {{ item.item }} nao respondeu como Nextcloud saudavel."
+      loop: "{{ test_public_status_by_ip.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      tags: [never, external]
+
+- name: Executar failover controlado e revalidar o cluster
+  hosts: nextcloud_cluster[0]
+  gather_facts: false
+  become: true
+  vars:
+    test_allow_destructive: false
+    test_failover_candidate: ''
+
+  tasks:
+    - name: Exigir autorizacao e candidato explicitos
+      ansible.builtin.assert:
+        that:
+          - test_allow_destructive | bool
+          - test_failover_candidate | length > 0
+          - test_failover_candidate in (groups['nextcloud_cluster'] | map('extract', hostvars, 'patroni_name') | list)
+        fail_msg: >-
+          Use --tags failover -e test_allow_destructive=true
+          -e test_failover_candidate=<patroni_name> somente em homologacao.
+      tags: [never, failover]
+
+    - name: Executar failover Patroni
+      ansible.builtin.command:
+        argv:
+          - patronictl
+          - -c
+          - /etc/patroni/patroni.yml
+          - failover
+          - "{{ patroni_scope }}"
+          - --candidate
+          - "{{ test_failover_candidate }}"
+          - --force
+      changed_when: true
+      tags: [never, failover]
+
+    - name: Aguardar PostgreSQL pelo VIP depois do failover
+      ansible.builtin.wait_for:
+        host: "{{ vip_address }}"
+        port: "{{ postgres_port }}"
+        connect_timeout: 3
+        timeout: 60
+      tags: [never, failover]
+
+    - name: Orientar a revalidacao completa
+      ansible.builtin.debug:
+        msg: Execute novamente o playbook sem tags para confirmar Patroni, VIP, Nextcloud e Garage.
+      tags: [never, failover]

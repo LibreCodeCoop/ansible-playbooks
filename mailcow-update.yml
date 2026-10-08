@@ -1,0 +1,25 @@
+#- name:  Atualiza o Mailcow
+# Como utilizar esta playbook:
+# ansible-playbook -i inventory.ini  mailcow-update.yml 
+
+- hosts: mail_servers
+  gather_facts: no
+  become: true
+  vars:
+    mailcow__install_updates: yes
+    mailcow__install_path: ~/projects/mailcow-dockerized
+
+  tasks:
+    - name: Update mailcow
+      become: yes
+      command: ./update.sh -f
+      args:
+        chdir: "{{ mailcow__install_path }}"
+      register: mailcow_update
+      changed_when: 'not "No updates are available" in mailcow_update.stdout'
+      tags:
+        - skip_ansible_lint
+
+    - name: Show mailcow update log
+      debug:
+        var: mailcow_update.stdout_lines

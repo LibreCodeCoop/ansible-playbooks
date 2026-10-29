@@ -1,37 +1,35 @@
 ---
-- name: Atualizar cache do apt
-  apt:
-    update_cache: yes
+- name: Require recorded authorization for potentially disruptive updates
+  ansible.builtin.assert:
+    that:
+      - (debian_update_change_ref | length) > 0
+      - (debian_update_approved_by | length) > 0
+      - debian_update_target_host == inventory_hostname
+      - ansible_play_hosts_all | length == 1
+    fail_msg: >-
+      Package upgrades require a recorded customer/operator approval,
+      one explicitly selected host and a separately approved maintenance window.
+  when: debian_update_apply | bool
+
+- name: Apply explicitly approved distribution package updates
+  ansible.builtin.apt:
+    update_cache: true
     cache_valid_time: 3600
-
-- name: Fazer upgrade dos pacotes
-  apt:
     upgrade: dist
-    autoremove: yes
-    autoclean: yes
-  register: upgrade_result
+    autoremove: false
+    autoclean: false
+  register: debian_update_upgrade_result
+  when: debian_update_apply | bool
 
-- name: Verificar se reinicialização é necessária
-  stat:
+- name: Detect whether packages request a reboot
+  ansible.builtin.stat:
     path: "{{ reboot_required_file }}"
-  register: reboot_required
+  register: debian_update_reboot_required
 
-- name: Reiniciar servidor se necessário
-  reboot:
-    reboot_timeout: 300
-    connect_timeout: 5
-    test_command: uptime
-  when: reboot_required.stat.exists
-
-- name: Coletar serviços disponíveis após reinicialização
-  ansible.builtin.service_facts:
-  when: reboot_required.stat.exists
-
-- name: Verificar serviços críticos após reinicialização
-  ansible.builtin.systemd:
-    name: "{{ item }}"
-    state: started
-  loop: "{{ critical_services }}"
-  when:
-    - reboot_required.stat.exists
-    - item in ansible_facts.services or (item ~ '.service') in ansible_facts.services
+- name: Report reboot request without restarting the server
+  ansible.builtin.debug:
+    msg: >-
+      Host {{ inventory_hostname }}: reboot_required={{
+      debian_update_reboot_required.stat.exists | bool }}.
+      No reboot will be performed by this role.
+      Request a separate approved maintenance window before restarting.

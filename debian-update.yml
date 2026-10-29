@@ -1,7 +1,7 @@
 ---
 # Do not gather facts or connect to every host by default.
 - name: Apply explicitly approved Debian updates on one host
-  hosts: "{{ debian_update_target_host | default('no_host_selected') }}"
+  hosts: "{{ debian_update_target_host | default('no_host_selected', true) }}"
   become: true
   gather_facts: false
 

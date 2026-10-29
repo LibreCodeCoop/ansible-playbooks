@@ -1,4 +1,9 @@
 ---
+# No changes are made without an explicit, single-host approved run.
+debian_update_apply: false
+debian_update_target_host: ""
+debian_update_approved_by: ""
+debian_update_change_ref: ""
 reboot_required_file: /var/run/reboot-required
 critical_services:
   - ssh

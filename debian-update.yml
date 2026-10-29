@@ -1,6 +1,22 @@
 ---
-- name: Atualizar servidores Debian
-  hosts: all
-  become: yes
+# Do not gather facts or connect to every host by default.
+- name: Apply explicitly approved Debian updates on one host
+  hosts: "{{ debian_update_target_host | default('no_host_selected', true) }}"
+  become: true
+  gather_facts: false
+
+  pre_tasks:
+    - name: Reject updates without a recorded single-host approval
+      ansible.builtin.assert:
+        that:
+          - debian_update_apply | default(false) | bool
+          - (debian_update_change_ref | default('') | length) > 0
+          - (debian_update_approved_by | default('') | length) > 0
+          - debian_update_target_host == inventory_hostname
+          - ansible_play_hosts_all | length == 1
+        fail_msg: >-
+          Require a reviewed, host-specific customer and operator approval
+          before accessing a production system. Values alone do not prove consent.
+
   roles:
     - debian-update

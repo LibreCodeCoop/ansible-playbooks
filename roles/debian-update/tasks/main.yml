@@ -16,16 +16,27 @@
     path: "{{ reboot_required_file }}"
   register: reboot_required
 
+- name: Informar reinicialização pendente sem autorização
+  ansible.builtin.debug:
+    msg: "Reinicialização necessária; agendar janela e executar com debian_update_allow_reboot=true após aprovação explícita."
+  when:
+    - reboot_required.stat.exists
+    - not (debian_update_allow_reboot | bool)
+
 - name: Reiniciar servidor se necessário
   reboot:
     reboot_timeout: 300
     connect_timeout: 5
     test_command: uptime
-  when: reboot_required.stat.exists
+  when:
+    - reboot_required.stat.exists
+    - debian_update_allow_reboot | bool
 
 - name: Coletar serviços disponíveis após reinicialização
   ansible.builtin.service_facts:
-  when: reboot_required.stat.exists
+  when:
+    - reboot_required.stat.exists
+    - debian_update_allow_reboot | bool
 
 - name: Verificar serviços críticos após reinicialização
   ansible.builtin.systemd:
@@ -34,4 +45,5 @@
   loop: "{{ critical_services }}"
   when:
     - reboot_required.stat.exists
+    - debian_update_allow_reboot | bool
     - item in ansible_facts.services or (item ~ '.service') in ansible_facts.services

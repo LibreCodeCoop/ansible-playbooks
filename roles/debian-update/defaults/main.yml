@@ -2,3 +2,6 @@
 reboot_required_file: /var/run/reboot-required
 critical_services:
   - ssh
+
+# Explicit approval is required for each maintenance run before a reboot.
+debian_update_allow_reboot: false
